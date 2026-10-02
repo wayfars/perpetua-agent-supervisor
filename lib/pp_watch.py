@@ -569,8 +569,10 @@ def _http_eval(goal: Path, w: dict, wp: Path, st: dict) -> dict | None:
     status, body, err = _fetch(url)
     if err is not None:
         return _record_error(goal, w, wp, st, f"http {url}: {err}")
-    digest = (f"{status}:{hashlib.sha256((body or '').encode('utf-8', 'replace'))
-               .hexdigest()[:16]}")
+    body_digest = hashlib.sha256(
+        (body or "").encode("utf-8", "replace")
+    ).hexdigest()[:16]
+    digest = f"{status}:{body_digest}"
     old = st.get("last_digest")
     changed = (old is None) or (old != digest)
     st["last_digest"] = digest
