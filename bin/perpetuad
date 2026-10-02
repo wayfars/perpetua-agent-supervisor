@@ -1,0 +1,2341 @@
+#!/usr/bin/env python3
+"""perpetuad — the supervisor that makes a goal outlive its sessions.
+
+One process per goal. It briefs a session, runs pi to completion, guarantees the
+handoff exists, decides what the next session inherits, and starts it. It keeps
+doing that until check.sh passes.
+
+The lifecycle shape (launch pi -> detect why it exited -> do work while pi is
+down -> relaunch on the SAME --session-id) follows the underlying CLI's session
+semantics. Its cwd warning applies here too: --session-id is
+project-scoped by cwd, so the goal's workspace must be the cwd for every launch of
+a given session, or the resume silently lands in a different session.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import contextlib
+import shutil
+import signal
+import subprocess
+import threading
+import sys
+import time
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import pp_backend                                          # noqa: E402
+import pp_control
+import pp_routing
+import pp_amend
+import pp_attribute
+import pp_briefing                                         # noqa: E402
+import pp_check                                            # noqa: E402
+import pp_escalate
+import pp_integrity
+import pp_human                                            # noqa: E402
+import pp_journal                                          # noqa: E402
+import pp_machine                                          # noqa: E402
+import pp_notify                                           # noqa: E402
+import pp_persona
+import pp_probe
+import pp_progress                                         # noqa: E402
+import pp_reaper                                           # noqa: E402
+import pp_refine
+import pp_state
+import pp_swarm                                            # noqa: E402
+import pp_watch                                           # noqa: E402
+from pp_common import (BIN, ROOT, TEMPLATES, LockBusy, UnsafeGoalId, goal_dir,  # noqa: E402
+                       UnsafeRunId, run_id,
+                       lifetime_lock, log, now_iso, pid_alive,
+                       proc_start_ticks, read_json, run_dir, write_json)
+
+WIKI_SCRIPTS = Path(os.environ["PERPETUA_WIKI_SCRIPTS"]) if os.environ.get(
+    "PERPETUA_WIKI_SCRIPTS") else None
+BACKOFF_S = [0, 30, 60, 180, 300, 600, 900]
+
+# systemd's Restart=on-failure would restart a supervisor that paused itself,
+# and it would do so every RestartSec forever. A pause is a deliberate, durable
+# stop that only `perpetua resume` clears, so it exits with a status the unit
+# file names in RestartPreventExitStatus. Keep the two in sync.
+EXIT_PAUSED = 75          # EX_TEMPFAIL
+EXIT_BUSY = 3             # another supervisor owns this goal
+
+
+# ── helpers ───────────────────────────────────────────────────────────────
+def load_goal_cfg(goal: Path) -> dict:
+    cfg = read_json(goal / "goal.json", {}) or {}
+    cfg.setdefault("allow_hosted", False)
+    cfg.setdefault("default_backend", None)
+    cfg.setdefault("consolidate_every", 10)
+    cfg.setdefault("max_runs", None)          # None = unlimited, by design
+    cfg.setdefault("session_timeout_s", 10800)
+    cfg.setdefault("stall_timeout_s", 2400)
+    cfg.setdefault("no_progress_limit", 3)
+    # #3: how long an unacknowledged escalation sits before it bumps itself one
+    # severity. A goal paused overnight with the phone on silent is otherwise
+    # dead until a human happens to look.
+    cfg.setdefault("escalation_stale_s", pp_escalate.DEFAULT_STALE_S)
+    # How many consecutive sessions may claim the probe/refusal exemption before
+    # it stops being honoured. Without a cap, the first session to notice the
+    # exemption can declare every run a probe and the breaker never fires again.
+    cfg.setdefault("probe_limit", 2)
+    # #7: probes per swarm. A swarm is one run carried out by K parallel
+    # sessions, so this is not "how many runs at once" — it is how many ways one
+    # run is explored. Clamped at launch against what the backend can actually
+    # serve (pp_swarm.clamp_k); 0 disables the swarm entirely.
+    cfg.setdefault("swarm_k", pp_swarm.DEFAULT_K)
+    # The briefing is paid for out of the same context the work needs, so it is
+    # budgeted — but None means "derive it from the backend's real context
+    # window" (pp_briefing.allowance). It used to default to a flat 24,000
+    # characters against a 131,072-token model, which is why nine consecutive
+    # briefings on the first real goal dropped the board. A goal that sets a
+    # number here still wins.
+    cfg.setdefault("briefing_max_chars", None)
+    cfg.setdefault("notify", False)
+    # How long to wait after a run that failed, indexed by how many have failed in
+    # a row. Its LENGTH is also the give-up threshold: running out of backoff
+    # steps is what pauses the goal, so shortening this list makes a goal give up
+    # sooner as well as retry faster.
+    backoff = cfg.setdefault("backoff_s", list(BACKOFF_S))
+    if not isinstance(backoff, list) or not backoff:
+        cfg["backoff_s"] = list(BACKOFF_S)
+    return cfg
+
+
+def fingerprint(goal: Path, run_n: int | None = None) -> str:
+    """Did anything that counts as progress change? See pp_progress for what does."""
+    try:
+        state = pp_state.load(goal)
+    except FileNotFoundError:
+        state = {}
+    return pp_progress.snapshot(goal, state, exclude_run=run_n)
+
+
+def run_check(goal: Path) -> pp_check.Result:
+    """One implementation, shared with the CLI and the dashboard."""
+    return pp_check.run(goal)
+
+
+# Watchers get one look per 30s while a session runs (the poll loops below);
+# the between-runs loop calls pp_watch.tick directly, where each pass is a whole
+# run so no rate limit is needed. Both call sites are best-effort: a tick that
+# can raise is a watcher that can kill the goal, so pp_watch wraps every
+# evaluation in its own try/except and never raises out of here.
+WATCH_TICK_EVERY_S = 30
+_watch_last_tick = 0.0
+
+
+def _watch_tick(goal: Path) -> None:
+    global _watch_last_tick
+    if time.time() - _watch_last_tick < WATCH_TICK_EVERY_S:
+        return
+    _watch_last_tick = time.time()
+    pp_watch.tick(goal)
+
+
+def consolidate(goal: Path, spec: dict) -> None:
+    """Promote the run-to-run journal into durable OKF knowledge."""
+    wiki = goal / ".pi/wiki"
+    if not wiki.exists() or WIKI_SCRIPTS is None or not WIKI_SCRIPTS.exists():
+        return
+    for script, args in (("review.py", ["run"]), ("promote.py", ["run"])):
+        path = WIKI_SCRIPTS / script
+        if not path.exists():
+            continue
+        try:
+            # --project-wiki is a bare flag (it means "find the git root"); a
+            # path belongs to --wiki, and both must precede the subcommand.
+            proc = subprocess.run([sys.executable, str(path), "--wiki", str(wiki), *args],
+                                  capture_output=True, text=True, timeout=1800)
+            log(f"consolidate {script}: exit {proc.returncode} "
+                f"{(proc.stdout or proc.stderr or '').strip()[-200:]}")
+        except Exception as exc:                            # noqa: BLE001
+            log(f"consolidate {script} failed: {type(exc).__name__}: {exc}")
+
+
+# ── #9 periodic meta-review ───────────────────────────────────────────────
+# A chain of sessions that only ever reports on itself drifts: every handoff is
+# written by the session that wants it to read well, and the next session
+# inherits the claim rather than the evidence. So one session in
+# `consolidate_every` is spent checking the others instead of advancing the goal.
+#
+# It is a normal session with the standing persona swapped for `auditor` and a
+# nudge that scopes it — not a second kind of run, and not something the
+# supervisor does itself. The supervisor writing verdicts would be the supervisor
+# marking the goal's homework, and it has no way to read a repository.
+AUDIT_PERSONA = "auditor"
+#: How far back one audit looks. The model pass below costs a call per run, so
+#: an audit after a long gap examines the most recent window rather than every
+#: run since the beginning of the goal.
+AUDIT_MAX_RUNS = 10
+AUDIT_VERIFY_TIMEOUT_S = 300
+
+
+def _to_int(value, default: int = 0) -> int:
+    """Coerce a state field to an int without raising.
+
+    `state.json` is one `cd ..` from the agent's shell, and a torn-line guard
+    does not help here: a perfectly valid JSON document with `"run": "soon"`
+    would put a ValueError through `int()` and out of the supervisor's loop.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _audit_record(state: dict, key: str) -> dict:
+    """An audit record from state, or an empty one — never something to index."""
+    rec = state.get(key)
+    return rec if isinstance(rec, dict) else {}
+
+
+def audit_dir(goal: Path) -> Path:
+    """Where leads live. Outside KNOWLEDGE_GLOBS: a lead is not knowledge yet."""
+    return goal / "audit"
+
+
+def _ensure_auditor_persona(goal: Path) -> bool:
+    """Copy the shipped auditor persona into the goal, once.
+
+    This is the supervisor writing inside KNOWLEDGE_GLOBS, which invariant 3
+    forbids for a reason — it must not be able to forge progress. It cannot here:
+    the copy happens BETWEEN runs, and a run's before/after fingerprints are both
+    taken inside `one_run`, so no run's progress window contains this write.
+    `test_audit` pins that.
+    """
+    if pp_persona.exists(goal, AUDIT_PERSONA):
+        return True
+    src = TEMPLATES / "personas" / f"{AUDIT_PERSONA}.md"
+    try:
+        text = src.read_text(encoding="utf-8")
+    except OSError as exc:
+        log(f"audit: no auditor persona template at {src} ({exc}) — not scheduling")
+        return False
+    dst = goal / "personas" / f"{AUDIT_PERSONA}.md"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # Unlink the NAME first. `pp_persona.exists` said no, which means anything
+    # sitting here is not a regular file — a symlink, and `write_text` follows
+    # one straight to whatever it points at.
+    if dst.is_symlink() or dst.exists():
+        dst.unlink(missing_ok=True)
+    dst.write_text(text, encoding="utf-8")
+    log(f"audit: installed the {AUDIT_PERSONA} persona from the template")
+    return True
+
+
+def _audit_leads(goal: Path, spec: dict, *, since: int, upto: int) -> list[str]:
+    """§4c: which `done` claims their own transcripts do not support.
+
+    Leads, never verdicts — the model pass sees the transcript and nothing else,
+    so it cannot know about a commit made outside it. The auditor session checks
+    each one against the repository; this only decides what is worth looking at.
+    Best effort throughout: an unreachable model means an audit with no leads,
+    not an audit that does not happen.
+    """
+    leads: list[str] = []
+    for r in range(max(since + 1, upto - AUDIT_MAX_RUNS + 1), upto + 1):
+        try:
+            handoff = read_json(pp_journal.handoff_path(goal, r), {}) or {}
+            if not (handoff.get("done") or []):
+                continue
+            session_id = handoff.get("session_id")
+            if not session_id:
+                continue
+            transcript = pp_reaper.extract_transcript(session_id)
+            leads += pp_reaper.verify(handoff, transcript, spec,
+                                      cwd=goal / "workspace",
+                                      timeout=AUDIT_VERIFY_TIMEOUT_S)
+        except Exception as exc:                            # noqa: BLE001
+            log(f"audit: run {r} not machine-checked: {type(exc).__name__}: {exc}")
+    return leads
+
+
+def _write_leads(goal: Path, *, upto: int, since: int, leads: list[str]) -> Path | None:
+    if not leads:
+        return None
+    d = audit_dir(goal)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{upto:04d}-leads.md"
+    path.write_text(
+        f"# Verification leads — runs {since + 1}-{upto}\n\n"
+        f"_Produced by a local model reading each session's own transcript against "
+        f"its own `done` list. It could not see the repository, so every line "
+        f"below is a QUESTION for the auditor to answer, not a finding. Confirm or "
+        f"dismiss each one against the workspace before saying anything about it._\n\n"
+        + "\n".join(f"- {line}" for line in leads) + "\n", encoding="utf-8")
+    return path
+
+
+def _audit_restore(audit: dict, *, run: int, reason: str):
+    """The state patch that gives back what an audit run borrowed.
+
+    An audit borrows the standing persona and the pending nudge for exactly one
+    session. Giving them back is not optional bookkeeping: a crashed audit that
+    kept the persona would leave the goal permanently staffed by an auditor that
+    is forbidden from advancing it, which is a stall the breaker cannot see.
+    """
+    def restore(s):
+        s["audit_last"] = {"run": run, "since": audit.get("since"),
+                           "upto": audit.get("upto"), "at": now_iso(),
+                           "outcome": reason}
+        # Deliberately overrides a `next_persona` the audit session set for
+        # itself: an audit does not get to change the goal's direction, and the
+        # auditor persona says so out loud.
+        s["persona"] = audit.get("restore_persona")
+        s.setdefault("next", {})["nudge"] = audit.get("restore_nudge")
+        s["audit"] = None
+    return restore
+
+
+def schedule_audit(goal: Path, cfg: dict, spec: dict, state: dict) -> None:
+    """Arm the next session as the audit. Never raises: a side channel."""
+    try:
+        upto = _to_int(state.get("run"))
+        since = _to_int(_audit_record(state, "audit_last").get("run"))
+        if upto <= since:
+            return
+        if not _ensure_auditor_persona(goal):
+            return
+        leads = _audit_leads(goal, spec, since=since, upto=upto)
+        leads_path = _write_leads(goal, upto=upto, since=since, leads=leads)
+        nudge = (
+            f"**This session is the periodic audit.** Verify, do not advance: check "
+            f"what runs {since + 1}-{upto} claimed against what is actually in the "
+            f"workspace, the board and the criteria. Record what you check with "
+            f"`board_verify`, post ONE verdict message naming runs and claims "
+            f"specifically, and end `volunteered-probe` with what you found — "
+            f"including \"nothing was wrong\", which is a result. Do not fix what you "
+            f"find and do not tick criteria; the next working session decides what "
+            f"to do about it.")
+        if leads_path:
+            nudge += (f" A local model read each session's transcript against its own "
+                      f"`done` list and produced {len(leads)} lead(s) at "
+                      f"`{leads_path}`. They are questions, not findings — it could "
+                      f"not see the repository. Check each one yourself.")
+
+        def arm(s):
+            # Both the persona and the nudge are RESTORED afterwards. The audit
+            # borrows the session; it does not get to change the goal's standing
+            # direction, and a no-progress nudge the previous run earned must not
+            # be swallowed by an audit that happened to fall on the same turn.
+            s["audit"] = {"run": _to_int(s.get("run")) + 1,
+                          "since": since, "upto": upto,
+                          "restore_persona": s.get("persona"),
+                          "restore_nudge": (s.get("next") or {}).get("nudge"),
+                          "leads": str(leads_path) if leads_path else None,
+                          "armed_at": now_iso()}
+            s["persona"] = AUDIT_PERSONA
+            s["next"]["nudge"] = nudge
+        state = pp_state.patch(goal, arm)
+        log(f"audit armed for run {state['audit']['run']}: runs {since + 1}-{upto}, "
+            f"{len(leads)} machine lead(s)")
+        pp_machine.event(
+            goal, "audit-scheduled",
+            f"The next session is the periodic audit of runs {since + 1}-{upto}. It "
+            f"runs as `{AUDIT_PERSONA}`, verifies rather than advances, and is exempt "
+            f"from the no-progress breaker."
+            + (f" {len(leads)} machine-generated lead(s) were attached."
+               if leads else " No machine leads were produced."),
+            run=upto, since=since, upto=upto, leads=len(leads))
+    except Exception as exc:                            # noqa: BLE001
+        log(f"audit: not scheduled: {type(exc).__name__}: {exc}")
+
+
+# ── tmux ──────────────────────────────────────────────────────────────────
+# Every session runs in its own tmux window so it can be watched live, not only
+# read back from a log after it dies. One session per goal, named
+# perpetua-<goal-id> — deliberately its own session and never an existing one,
+# for the same reason `handoff` got its own: a background job must not be able to
+# yank an attached client off the window someone is using.
+def tmux(*args: str, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, **kw)
+
+
+def tmux_available() -> bool:
+    # The opt-out exists because "watch it live" is a convenience, not a
+    # requirement: a headless box, a systemd unit with no tmux server, or a test
+    # that wants the supervisor to own the pi process directly all need the plain
+    # child path, and discovering it only by uninstalling tmux is no way to get it.
+    if os.environ.get("PERPETUA_NO_TMUX"):
+        return False
+    return shutil.which("tmux") is not None
+
+
+def tmux_session(goal: Path) -> str:
+    return f"perpetua-{goal.name}"
+
+
+def ensure_tmux_session(goal: Path) -> None:
+    sess = tmux_session(goal)
+    if tmux("has-session", "-t", f"={sess}").returncode == 0:
+        return
+    # The first window just follows the supervisor log, so the session outlives any
+    # individual run and there is always something to attach to.
+    tmux("new-session", "-d", "-s", sess, "-n", "supervisor",
+         f"tail -n 200 -F {shlex.quote(str(goal / 'supervisor.log'))}")
+
+
+def tmux_pane_pid(target: str) -> int | None:
+    out = tmux("list-panes", "-t", target, "-F", "#{pane_pid}").stdout.strip()
+    try:
+        return int(out.splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def tmux_pane_pid_settled(target: str, timeout: float = 5.0) -> int | None:
+    """The pane pid, waiting briefly for tmux to have one to report.
+
+    A window can exist before its pane has a pid, and asking once loses the race.
+    That matters more than it sounds: the pid and its start time ARE the run's
+    identity, and a run recorded without one cannot later be verified, so a
+    single unlucky query would leave a session that SIGTERM refuses to kill.
+    """
+    deadline = time.time() + timeout
+    while True:
+        pid = tmux_pane_pid(target)
+        if pid or time.time() >= deadline:
+            return pid
+        time.sleep(0.1)
+
+
+def tmux_window_alive(target: str) -> bool:
+    return tmux("list-panes", "-t", target).returncode == 0
+
+
+# ── the run ───────────────────────────────────────────────────────────────
+def launch_pi(goal: Path, cfg: dict, n, spec: dict,
+              persona: str | None, session_id: str, briefing_file: Path,
+              kickoff: str, on_claim=None, on_launched=None,
+              cwd: Path | None = None, role: str | None = None) -> tuple[int, str]:
+    """Run one pi session to completion.
+
+    Two callbacks, because "we own a process" and "a session was delivered" are
+    different facts that happen at different instants and must not be conflated:
+
+    * `on_claim(record)` — we are now responsible for killing something. Fires as
+      early as possible, before the process can exist unrecorded, and again to
+      upgrade the record once the pid is verified.
+    * `on_launched()` — a session really is running. Fires only after creation has
+      succeeded, so a refused launch cannot be mistaken for a delivered briefing.
+    """
+    rd = run_dir(goal, n)
+    log_file = rd / "pi.log"
+    # A swarm probe runs in its own git worktree, not the shared workspace —
+    # that isolation is the entire reason the swarm can run K sessions at once.
+    workdir = cwd or (goal / "workspace")
+    cfg = pp_routing.run_config(cfg, spec)
+    hard = float(cfg["session_timeout_s"])
+    # #7: installed against the MAIN workspace, never `workdir` — a probe's
+    # worktree's .git is a file pointing at the shared gitdir, and hooks live
+    # there once, already shared across every worktree. Idempotent and cheap
+    # enough to call on every launch, which is what makes a goal created
+    # before this feature existed get the hook on its very next run rather
+    # than needing a migration.
+    pp_attribute.install(goal / "workspace")
+    # The session needs to know its own wall clock. Without this the extension can
+    # only see the context window filling, which on a slow local model never
+    # happens before the hour is up — the first demo runs each did an hour of good
+    # research and were killed with no handoff.
+    env = {
+        **os.environ,
+        "PERPETUA_BUDGET_S": str(int(hard)),
+        "PERPETUA_REASONING_EFFORT": str(spec.get("reasoning_effort") or ""),
+        "PERPETUA_REASONING_MODEL": spec["model"],
+        "PERPETUA_CONTEXT_TOKENS": str(spec.get("context_tokens") or ""),
+        "PERPETUA_DEADLINE_EPOCH": str(int(time.time() + hard)),
+        "PERPETUA_ROOT": str(ROOT),
+        "PERPETUA_GOAL_DIR": str(goal),
+        # Canonical, so the id a session reports itself by is the id its run
+        # directory and journal entry already use. Before D4 this was str(n) —
+        # "42" against a path's "0042" — and the ledger rows written from it
+        # carried that second spelling into storage.
+        "PERPETUA_RUN": run_id(n),
+        # Read by pp-tool's PROBE_FORBIDDEN gate. It is the explicit half of that
+        # check only: the load-bearing half is the run id's `.k`, because this
+        # variable belongs to the session and a probe can unset it.
+        "PERPETUA_ROLE": role or "",
+        "PERPETUA_PERSONA": persona or "",
+        "PERPETUA_BACKEND_CLASS": spec["class"],
+        "PERPETUA_SESSION_ID": session_id,
+        "PERPETUA_TOOL": str(BIN / "pp-tool"),
+        # Per-run trace of what the convergence hook actually saw. Cheap, and the
+        # alternative is guessing why a nudge that never appears did not appear.
+        "PERPETUA_TRACE": str(rd / "trace.jsonl"),
+        # #7: belt and braces alongside the trailer hook — readable identity
+        # in `git log` even before anyone looks at a trailer, and it survives
+        # a plain `git commit -m` the same way the hook does (env vars beat a
+        # workspace's configured user.name/email).
+        **pp_attribute.author_env(run=run_id(n), persona=persona),
+    }
+    cmd = ["pi", "-p",
+           "--provider", spec["provider"], "--model", spec["model"],
+           "--session-id", session_id,
+           "--append-system-prompt", str(briefing_file),
+           kickoff]
+    if spec.get("thinking"):
+        cmd[2:2] = ["--thinking", spec["thinking"]]
+
+    log(f"launching pi: {spec['provider']}/{spec['model']} session {session_id[:8]} "
+        f"persona={persona or 'generalist'}")
+    write_json(rd / "launch.json", {"cmd": cmd, "at": now_iso(),
+                                    "session_id": session_id, "backend": spec["class"],
+                                    "persona": persona,
+                                    "capabilities": {k: spec.get(k) for k in
+                                        ("context_tokens", "slots", "thinking", "reasoning_effort")},
+                                    "session_timeout_s": int(hard)})
+
+    stall = float(cfg["stall_timeout_s"])
+    started = time.time()
+
+    if not tmux_available():
+        log("tmux not found — running pi as a direct child (no live attach)")
+        return _launch_direct(cmd, goal, workdir, env, log_file, session_id, hard,
+                              stall, started, on_claim, on_launched, spec=spec, rd=rd)
+
+    # tmux owns the process, so the exit code comes back through a file rather than
+    # wait(). The window is disposable; pi.log is the durable record, kept by
+    # pipe-pane so the stall watchdog still has an mtime to watch.
+    exit_file = rd / "exit_code"
+    exit_file.unlink(missing_ok=True)
+    ensure_tmux_session(goal)
+
+    sess = tmux_session(goal)
+    # The window name carries a per-launch token as well as the run number. Two
+    # launches of the same run number are supposed to be impossible now that a
+    # supervisor holds an exclusive lock, but a name that can collide turns that
+    # invariant into a silent second pi process, so it is made uncollidable
+    # instead of merely unlikely.
+    # run_id, not `:04d` — a probe's id is a string ("0042.3") and an int
+    # format spec raises on it. This was the one site D1's audit missed, and it
+    # is on the tmux path, which every swarm test bypassed with no_tmux().
+    window = f"run-{run_id(n)}-{uuid.uuid4().hex[:6]}"
+    target = f"={sess}:{window}"
+    inner = (f"{shlex.join(cmd)}; printf '%s' $? > {shlex.quote(str(exit_file))}")
+
+    env_flags: list[str] = []
+    for key, value in env.items():
+        if key.startswith("PERPETUA_"):
+            env_flags += ["-e", f"{key}={value}"]
+
+    # Claim the window name BEFORE creating it. The name carries a uuid minted for
+    # this run alone, so recording it early costs nothing if creation then fails
+    # (terminate_run finds no such window and does nothing), and it means there is
+    # no instant in which a live session exists that we have not written down.
+    # Claiming first is why no signal masking is needed on this path — masking
+    # around tmux would leak a blocked SIGTERM into the pane it spawns.
+    if on_claim:
+        on_claim({"kind": "tmux", "tmux_session": sess, "tmux_window": window,
+                  "tmux_target": target, "pid": None, "pid_start_ticks": None})
+    made = tmux("new-window", "-d", "-t", f"={sess}", "-n", window,
+                "-c", str(workdir), *env_flags, inner)
+    if made.returncode != 0:
+        # Deliberately NOT falling back to a direct child. The old fallback could
+        # not tell "tmux refused" from "the window already exists because a pi is
+        # already running in it", so the recovery for a duplicate launch was to
+        # start a *second* pi on the same session id and the same workspace.
+        # Failing the run is recoverable; two agents writing the same files is not.
+        log(f"tmux new-window failed ({made.stderr.strip()}) — abandoning this run "
+            f"rather than risking a second pi on the same session")
+        return -1, "tmux-launch-failed"
+
+    tmux("pipe-pane", "-o", "-t", target, f"cat >> {shlex.quote(str(log_file))}")
+    if on_launched:
+        on_launched()
+    pane_pid = tmux_pane_pid_settled(target)
+    if pane_pid and on_claim:
+        on_claim({"kind": "tmux", "tmux_session": sess, "tmux_window": window,
+                  "tmux_target": target, "pid": pane_pid,
+                  "pid_start_ticks": proc_start_ticks(pane_pid)})
+    elif not pane_pid:
+        log(f"tmux never reported a pane pid for {target} — this supervisor can "
+            f"still stop the run (it minted the window name), but a supervisor "
+            f"recovering it after a crash will not be able to verify it")
+    log(f"session is live in tmux — attach with:  tmux attach -t {sess}")
+
+    reason = "exited"
+    while True:
+        time.sleep(5)
+        _watch_tick(goal)
+        if exit_file.exists():
+            break
+        if not tmux_window_alive(target):
+            reason = "window-closed"
+            break
+        elapsed = time.time() - started
+        if elapsed > hard:
+            reason = "session-timeout"
+            break
+        if _stalled(log_file, session_id, stall, spec, rd=rd):
+            reason = "stalled"
+            break
+        rn = _runaway_turn(spec, rd=rd)
+        if rn:
+            write_json(rd / "runaway.json", {
+                "n_decoded": rn.get("n_decoded"), "task_id": rn.get("task_id"),
+                "n_predict": rn.get("n_predict"), "limit": rn.get("limit"),
+                "at": now_iso()})
+            log(f"run {n}: one turn at {rn.get('n_decoded')} tokens "
+                f"(limit {rn.get('limit')}) — stopping before pi discards it")
+            reason = "runaway-turn"
+            break
+
+    if reason != "exited":
+        log(f"terminating pi ({reason})")
+        pid = tmux_pane_pid(target)
+        if pid:
+            _kill_pid(pid)
+        tmux("kill-window", "-t", target)
+
+    try:
+        code = int((exit_file.read_text().strip() or "-1"))
+    except (OSError, ValueError):
+        code = -1
+    tmux("kill-window", "-t", target)          # no-op if already gone
+    return code, reason
+
+
+# pi sends no per-model maxTokens for the local class, so a turn's output ceiling
+# is whatever `params.n_predict` on the slot says (pi's own budget, clamped by
+# models.json). A turn that REACHES that ceiling is discarded by pi whole — no
+# file, no transcript, and the session often exits with no handoff. Stop it a
+# little short so the same session can be resumed with a corrective nudge instead
+# of paying the full generation and losing it. RUNAWAY_FLOOR guards the case
+# where the slot reports no n_predict at all.
+RUNAWAY_FRACTION = 0.9
+RUNAWAY_FLOOR = 14_000
+
+
+def _trace(rd: Path | None, obj: dict) -> None:
+    """Append one line to this run's trace.jsonl — the supervisor's own
+    entries in the same file the pi extension writes turn-by-turn convergence
+    observations to. #6: a divergence between two liveness stores (or a
+    verdict site that could not get a second store to agree with in the first
+    place) must be recorded, not merely acted on silently — a check that
+    never fires has to be distinguishable from one that fires and is ignored.
+    Best effort: `rd` may be None (a caller with no run dir yet) and a failed
+    write must never affect the verdict it is describing.
+    """
+    if rd is None:
+        return
+    try:
+        with open(rd / "trace.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"at": now_iso(), **obj}) + "\n")
+    except OSError:
+        pass
+
+
+def _runaway_turn(spec: dict | None, *, rd: Path | None = None) -> dict | None:
+    """A single in-flight generation about to hit its own output ceiling.
+
+    Returns the offending slot's progress dict (to record in runaway.json), or
+    None. "cannot tell" (no local server, /slots disabled, any error) is None,
+    never a kill — same contract as pp_backend.generating().
+
+    #6: this is unavoidably a SINGLE-store verdict. A generation in progress
+    is exactly the case the file-based stores (the pane log, the session
+    transcript) cannot see at all — that is the entire reason `/slots` is
+    consulted here rather than falling back to them — so there is no second
+    independent store to cross-check "is a turn running" against. What this
+    function CAN and must still get right is that the ceiling it compares
+    against belongs to the client it is polling for, not to a different one
+    sharing the same llama.cpp server — a swarm's own probes, or a different
+    goal pointed at the same workload class, both submit requests to the same
+    process and show up in the same `/slots` response.
+
+    That correlation is NOT available with the current server: llama.cpp's
+    `/slots` reports every slot's progress but not which HTTP client opened
+    it, and pi does not report back the task id it was assigned, so there is
+    no id this function could match against "ours" even in principle without
+    a protocol change on one side or the other. What is bounded is the
+    consequence of getting it wrong: at most one live session is killed and
+    resumed with a corrective nudge (an ordinary run) or one discardable
+    probe's turn is wasted (a swarm probe, which `pp_swarm`'s own design
+    already expects most of to be thrown away) — never a paused goal, never
+    lost goal state. When more than one slot is processing at the same poll,
+    correlation is genuinely ambiguous; that ambiguity is traced so a
+    misattributed kill is diagnosable after the fact rather than silent.
+    """
+    if not spec:
+        return None
+    prog = pp_backend.slot_progress(spec)
+    if not prog:
+        return None
+    processing = [s for s in prog if s.get("processing")]
+    if len(processing) > 1:
+        _trace(rd, {"hook": "runaway-ambiguous",
+                    "processing_slots": len(processing),
+                    "detail": "more than one slot busy at once — a runaway "
+                              "verdict here cannot be attributed to this "
+                              "run alone"})
+    for slot in processing:
+        decoded = slot.get("n_decoded")
+        if decoded is None:
+            continue
+        cap = slot.get("n_predict") or 0
+        limit = max(int(cap * RUNAWAY_FRACTION), RUNAWAY_FLOOR) if cap else RUNAWAY_FLOOR
+        if decoded >= limit:
+            return {**slot, "limit": limit}
+    return None
+
+
+def _stalled(log_file: Path, session_id: str, stall: float,
+             spec: dict | None, *, rd: Path | None = None) -> bool:
+    """Has this run gone quiet for longer than `stall`, really?
+
+    Two file mtimes — the pane log and the session JSONL — plus, when they both
+    say quiet, the backend itself. pi writes a turn when the turn ENDS, so a
+    model spending twenty minutes on one answer looks identical to a hang in the
+    files: measured on run 0002, nine minutes of active generation at 12.8 tok/s
+    with the transcript's mtime 547 seconds stale. The backend is asked only
+    once the cheap signals have already gone quiet, so the usual poll costs
+    nothing, and "cannot tell" (no local server, /slots disabled, any error)
+    falls back to the file verdict rather than inventing a liveness it did not
+    observe.
+
+    #6: the two file mtimes are one store (they measure the same thing — pi
+    having written something — through two different files) and the backend
+    is the SECOND, independent one; a kill only ever happens when both agree
+    the run is dead. When they disagree — files stale, backend generating —
+    that is heartbeat-write divergence, not a stuck agent, and it is traced
+    rather than silently overridden.
+    """
+    try:
+        quiet = time.time() - max(log_file.stat().st_mtime,
+                                  _session_mtime(session_id) or 0)
+    except OSError:
+        return False
+    if quiet <= stall:
+        return False
+    if spec:
+        verdict = pp_backend.generating(spec)
+        if verdict is True:
+            _trace(rd, {"hook": "stall-divergence", "quiet_s": round(quiet, 1),
+                        "stall_s": stall, "files_say": "stale",
+                        "backend_says": "generating"})
+            return False                 # it is producing tokens; not stalled
+    return True
+
+
+def _launch_direct(cmd: list[str], goal: Path, workdir: Path, env: dict, log_file: Path,
+                   session_id: str, hard: float, stall: float,
+                   started: float, on_claim=None, on_launched=None,
+                   spec: dict | None = None, rd: Path | None = None) -> tuple[int, str]:
+    """Fallback when tmux is unavailable: pi as a plain child of the supervisor."""
+    with open(log_file, "ab") as fh:
+        # Here the pid cannot be known before the fork, so the gap is closed with
+        # the mask instead — and preexec_fn lifts it again inside the child.
+        with deferred_signals():
+            proc = subprocess.Popen(cmd, cwd=str(workdir), env=env,
+                                    stdout=fh, stderr=subprocess.STDOUT,
+                                    start_new_session=True,
+                                    preexec_fn=unblock_in_child)
+            if on_claim:
+                on_claim({"kind": "direct", "pid": proc.pid,
+                          "pid_start_ticks": proc_start_ticks(proc.pid)})
+        if on_launched:
+            on_launched()
+        reason = "exited"
+        while True:
+            _watch_tick(goal)
+            try:
+                proc.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if time.time() - started > hard:
+                reason = "session-timeout"
+                break
+            if _stalled(log_file, session_id, stall, spec, rd=rd):
+                reason = "stalled"
+                break
+            rn = _runaway_turn(spec, rd=rd)
+            if rn:
+                if rd is not None:
+                    write_json(rd / "runaway.json", {
+                        "n_decoded": rn.get("n_decoded"), "task_id": rn.get("task_id"),
+                        "n_predict": rn.get("n_predict"), "limit": rn.get("limit"),
+                        "at": now_iso()})
+                log(f"one turn at {rn.get('n_decoded')} tokens "
+                    f"(limit {rn.get('limit')}) — stopping before pi discards it")
+                reason = "runaway-turn"
+                break
+        if proc.poll() is None:
+            log(f"terminating pi ({reason})")
+            _kill(proc)
+    return (proc.returncode if proc.returncode is not None else -1), reason
+
+
+def _session_mtime(session_id: str) -> float | None:
+    from pp_common import find_session_file
+    path = find_session_file(session_id)
+    try:
+        return path.stat().st_mtime if path else None
+    except OSError:
+        return None
+
+
+def _kill_pid(pid: int) -> None:
+    """Kill a process group by pid — used for the pane tmux owns."""
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    for _ in range(30):
+        time.sleep(1)
+        if not pid_alive(pid):
+            return
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    """Kill the whole process group — pi spawns children that outlive a bare TERM."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+# ── owning an in-flight run ───────────────────────────────────────────────
+# state["current_runs"] is the supervisor's only durable handle on the pi
+# processes it started — a list, because a swarm owns many at once. Each record
+# names *which* process, not merely that there is one, so that a supervisor which
+# comes back after a crash can tell "my run is still going" from "a stranger
+# inherited that pid" — and so that stopping is a targeted kill of exact windows
+# rather than a pattern match over the process table. ACTIVE mirrors the list,
+# keyed by canonical run id, for the signal handler's use.
+ACTIVE: dict = {}          # run id -> record, for the signal handler
+
+
+STOP_SIGNALS = {signal.SIGTERM, signal.SIGINT}
+
+
+@contextlib.contextmanager
+def deferred_signals():
+    """Hold SIGTERM/SIGINT until the block finishes, then let them fire.
+
+    Used only around "start the process and record that we own it": a signal
+    landing in that gap leaves a live agent session nothing knows about. The block
+    does no waiting, so the deferral is bounded by one fork, well inside
+    TimeoutStopSec.
+
+    **Anything spawned inside this block must restore the mask in the child**
+    (see `unblock_in_child`). A signal mask is inherited across fork *and* exec,
+    so a child started here would otherwise run with SIGTERM blocked for its whole
+    life — which turns every graceful stop into a 30-second wait for the SIGKILL
+    fallback, and denies pi any chance to shut down cleanly.
+    """
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def unblock_in_child() -> None:
+    """preexec_fn: undo deferred_signals() in the forked child before it execs."""
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+
+
+class Stopping(BaseException):
+    """SIGTERM/SIGINT. Raised out of the run loop so `finally` blocks all run."""
+
+
+def _record_active(goal: Path, run_key: str, info: dict) -> None:
+    """Record that this process launched, and now owns, the run `run_key`.
+
+    ACTIVE is keyed by the canonical run id so that several in-flight runs can
+    be recorded, upgraded and forgotten independently; the same key lines the
+    record up inside state["current_runs"]. A pid arrives in a later upgrade,
+    which is why the state stamp merges instead of replacing.
+    """
+    ACTIVE[run_key] = {"goal": goal, "minted_by": os.getpid(), **info}
+
+    def stamp(s):
+        pp_state.upsert_current_run(
+            s, run_key,
+            {**{k: v for k, v in info.items() if k != "goal"},
+             "supervisor_pid": os.getpid()})
+    pp_state.patch(goal, stamp)
+
+
+def _forget_active(run_key: str) -> None:
+    """Forget exactly one in-flight run — the one that just finished."""
+    ACTIVE.pop(run_key, None)
+
+
+def run_process_alive(rec: dict) -> bool:
+    """Is the exact process this record names still running?
+
+    A bare pid is not enough: the supervisor may have been down for hours, and a
+    recycled pid would read as a live session and get killed. Identity is
+    (pid, start_ticks) for the direct case, and additionally the tmux window's
+    *current* pane pid for the tmux case.
+    """
+    pid, ticks = rec.get("pid"), rec.get("pid_start_ticks")
+    if not pid or not ticks:
+        return False            # a bare pid is never sufficient ownership proof
+    if rec.get("kind") == "tmux":
+        target = rec.get("tmux_target") or (
+            f"={rec.get('tmux_session')}:{rec.get('tmux_window')}"
+            if rec.get("tmux_session") and rec.get("tmux_window") else None)
+        if not target or not tmux_available() or not tmux_window_alive(target):
+            return False
+        live = tmux_pane_pid(target)
+        if pid and live and live != pid:
+            return False        # the window name outlived our pane; not ours
+        return live == pid and pid_alive(live, ticks)
+    return pid_alive(pid, ticks)
+
+
+def terminate_run(rec: dict, *, trust_window: bool = False) -> str:
+    """Kill exactly the run this record names. Idempotent, and safe to call twice.
+
+    Identity is normally (pid, start ticks) plus, for tmux, the window's current
+    pane pid; without all of it we refuse, because a record inherited from a dead
+    supervisor could name anyone's process by now.
+
+    `trust_window` is the one exception, and it is not a weakening: it is set only
+    for a window THIS process created moments ago, whose name carries a uuid we
+    generated for this run alone. That name is proof of ownership in its own right
+    — nobody else can have minted it — so when tmux will not tell us the pane pid
+    we can still kill our own window by name. Refusing there would mean a stopped
+    supervisor leaves a live agent session behind, which is worse than every risk
+    the strictness is guarding against.
+    """
+    if not rec:
+        return "nothing to terminate"
+    what = []
+    pid, ticks = rec.get("pid"), rec.get("pid_start_ticks")
+    if rec.get("kind") == "tmux":
+        target = rec.get("tmux_target") or (
+            f"={rec.get('tmux_session')}:{rec.get('tmux_window')}"
+            if rec.get("tmux_session") and rec.get("tmux_window") else None)
+        if target and tmux_available() and tmux_window_alive(target):
+            live = tmux_pane_pid(target)
+            verified = bool(pid and ticks and live == pid and pid_alive(live, ticks))
+            if verified:
+                _kill_pid(live)
+                what.append(f"pane pid {live}")
+                tmux("kill-window", "-t", target)
+                what.append(f"tmux window {target}")
+            elif trust_window and rec.get("minted_by") == os.getpid():
+                # kill-window takes the pane's processes down with it, which is why
+                # this is sufficient even with no pid to signal directly.
+                tmux("kill-window", "-t", target)
+                what.append(f"tmux window {target} (unverified pane, name is ours)")
+    elif pid and ticks and pid_alive(pid, ticks):
+        _kill_pid(pid)
+        what.append(f"pid {pid}")
+    return ", ".join(what) or "already gone"
+
+
+def cleanup_active(reason: str) -> None:
+    """Terminate whatever this supervisor started, before it lets go of the goal.
+
+    Signal path, so it must not raise: a failure on one run — a terminate or a
+    state write — is caught per run, never around the loop, so runs B and C are
+    not hostage to run A. Each terminated run is stamped onto its own record in
+    state, which is what the next recover() finalises.
+    """
+    if not ACTIVE:
+        return
+    for run_key in list(ACTIVE):
+        rec = ACTIVE[run_key]
+        goal = rec.get("goal")
+        try:
+            log(f"cleaning up in-flight run {run_key} ({reason}): "
+                f"{terminate_run(rec, trust_window=True)}")
+            if goal is not None:
+                def mark(s):
+                    pp_state.upsert_current_run(
+                        s, run_key,
+                        {"terminated_at": now_iso(),
+                         "terminated_because": reason})
+                pp_state.patch(goal, mark)
+        except (FileNotFoundError, TimeoutError, OSError) as exc:
+            log(f"could not record the termination of run {run_key} "
+                f"in state.json: {exc}")
+    ACTIVE.clear()
+
+
+def finalize_interrupted_run(goal: Path, cfg: dict, rec: dict) -> None:
+    """Close the books on a run whose supervisor died before it could.
+
+    Without this, a restart reads state["run"] == N, allocates N+1, and the work
+    session N actually did is never journalled — the successor inherits a gap and
+    the run directory keeps a launch.json with no run.json forever.
+    """
+    n_raw = rec.get("n") or 0
+    if not n_raw:
+        return
+    # A run id is a string — "0042" ordinarily, "0042.3" for a probe — so a bare
+    # int() would raise on the first probe record this function ever sees. A
+    # record whose n does not parse is corrupt, and it is skipped, not raised
+    # through: one poisoned record must not take the reconcile loop down with it
+    # (failure class 3, applied to a state record).
+    try:
+        n = run_id(n_raw)
+    except UnsafeRunId:
+        log(f"skipping a corrupt run record: n={n_raw!r} does not parse as a run id")
+        return
+    # n is canonical (NNNN or NNNN.k) here, so the int part is a plain split.
+    n_int = int(n.split(".")[0])
+    session_id = rec.get("session_id") or ""
+    rd = run_dir(goal, n)
+    rd.mkdir(parents=True, exist_ok=True)
+
+    if run_process_alive(rec):
+        log(f"run {n} is STILL ALIVE after the supervisor stopped — terminating it "
+            f"({terminate_run(rec)})")
+        # Give the pi process a moment to flush its own exit.json/handoff.
+        time.sleep(2)
+    else:
+        log(f"run {n} was in flight when the supervisor stopped; it is dead now")
+
+    if not (rd / "run.json").exists():
+        exit_info = read_json(rd / "exit.json", {}) or {}
+        wedge = read_json(rd / "wedge.json")
+        try:
+            code = int((rd / "exit_code").read_text().strip() or "-1")
+        except (OSError, ValueError):
+            code = -1
+        write_json(rd / "run.json", {
+            "run": n, "session_id": session_id,
+            "backend": rec.get("backend"), "persona": rec.get("persona"),
+            "exit_code": code, "watchdog": "supervisor-interrupted",
+            "exit": exit_info, "wedged": bool(wedge), "ended_at": now_iso(),
+            "resumed": bool(rec.get("resumed")), "recovered": True,
+        })
+
+    handoff = read_json(pp_journal.handoff_path(goal, n))
+    if handoff is None:
+        log(f"run {n} left no handoff — reaping it before starting anything new")
+        try:
+            spec = pp_backend.resolve(rec.get("backend"),
+                                      allow_hosted=cfg["allow_hosted"])
+        except KeyError:
+            spec = pp_backend.resolve(None, allow_hosted=cfg["allow_hosted"])
+        data = pp_reaper.reap(session_id, spec, cwd=goal / "workspace",
+                              base_commit=_base_commit(goal, n))
+        data.update({"run": n, "session_id": session_id,
+                     "persona": rec.get("persona"), "backend": rec.get("backend"),
+                     "reason": "the supervisor stopped while this session was running"})
+        pp_journal.write_handoff(goal, n, data)
+        handoff = data
+    pp_journal.commit(goal, n)
+
+    ended_cleanly = handoff.get("source", "agent") == "agent"
+
+    def close(s):
+        s["status"] = pp_state.STATUS_IDLE
+        pp_state.drop_current_run(s, n)
+        s["run"] = max(int(s.get("run") or 0), n_int)
+        s["stats"]["runs_completed"] = s["stats"].get("runs_completed", 0) + 1
+        if ended_cleanly:
+            s["stats"]["sessions_ended_cleanly"] = (
+                s["stats"].get("sessions_ended_cleanly", 0) + 1)
+            s["breaker"]["consecutive_failures"] = 0
+        else:
+            s["stats"]["reaped"] = s["stats"].get("reaped", 0) + 1
+            s["breaker"]["consecutive_failures"] = (
+                s["breaker"].get("consecutive_failures", 0) + 1)
+    pp_state.patch(goal, close)
+    log(f"run {n} reconciled; the next run will be {n_int + 1:04d}")
+
+
+def _finalize_all(goal: Path, cfg: dict, records: list) -> None:
+    """Reconcile every in-flight record, each on its own.
+
+    A crashed swarm leaves K records; the one that is corrupt is exactly the one
+    that must not strand the other K-1. A finalise is expected to skip its own
+    corrupt record, and a raised one is logged here rather than taken down —
+    either way the next record still gets its chance.
+    """
+    for rec in list(records):
+        try:
+            finalize_interrupted_run(goal, cfg, rec)
+        except Exception as exc:                        # noqa: BLE001
+            log(f"could not reconcile run {rec.get('n')!r}: "
+                f"{type(exc).__name__}: {exc}")
+
+
+def _reconcile_swarm(goal: Path) -> None:
+    """Close the books on a swarm whose supervisor died before it could.
+
+    `state["swarm"]` is written before the first probe launches and cleared when
+    the swarm finishes, so finding one at startup means the swarm never ended:
+    the supervisor was killed, the box lost power, or systemd stopped it
+    mid-flight. A supervisor holds an exclusive lock, so a record still sitting
+    here cannot belong to a live one.
+
+    Two things have to happen, and the first is why this is not simply a delete.
+    The probes' branches are the ONLY durable form of whatever they managed to
+    do — their worktrees are throwaway, the goal's workspace never saw their
+    commits — so the crashed swarm is harvested and a synthesis nudge armed,
+    exactly as a clean swarm would. Only then is it moved to `swarm_last`, which
+    is what makes the next swarm destroy its worktrees.
+
+    Without this the record was written by `finish()` alone, so a crash left K
+    registered worktrees (a full checkout of the workspace each) and K branches
+    that no later path could reach: `_close_previous_swarm` only ever closes the
+    last *successful* swarm, and the run number had already moved past them.
+    They accumulated, unbounded, one set per crash.
+    """
+    state = pp_state.load(goal)
+    live = state.get("swarm")
+    if not isinstance(live, dict) or not live.get("run"):
+        return
+    n = live["run"]
+    try:
+        harvest = pp_probe.harvest(goal, n)
+    except Exception as exc:                                # noqa: BLE001
+        log(f"could not harvest the interrupted swarm {n}: "
+            f"{type(exc).__name__}: {exc}")
+        harvest = []
+    stat = pp_swarm.summarise(harvest)
+    log(f"swarm run {run_id(n)} was interrupted; harvested "
+        f"{stat['commits']} commit(s) from {stat['productive']}/{stat['probes']} "
+        f"probe(s) and armed the synthesis")
+
+    def close(s):
+        s["swarm"] = None
+        s["swarm_last"] = {"run": n, "k": live.get("k"), "at": now_iso(),
+                           "summary": stat, "interrupted": True}
+        # Only arm the synthesis if nothing else has claimed `next` since —
+        # a nudge the crash left behind is not worth overwriting a live one.
+        if not (s.get("next") or {}).get("nudge"):
+            s.setdefault("next", {})["nudge"] = pp_swarm.synthesis_nudge(
+                run_id(n), harvest)
+    pp_state.patch(goal, close)
+    pp_machine.event(
+        goal, "swarm-interrupted",
+        f"Swarm run {n} was interrupted before it could finish. Its "
+        f"{stat['probes']} probe(s) were harvested ({stat['commits']} commit(s) "
+        f"on their branches) and the next session synthesises them. The "
+        f"worktrees are closed when the next swarm starts.",
+        run=n, k=stat["probes"], commits=stat["commits"])
+
+
+def recover(goal: Path, cfg: dict) -> None:
+    """Startup reconciliation. Runs before a single new run number is allocated."""
+    pp_journal.reconcile(goal, int(pp_state.load(goal).get("run") or 0))
+    _finalize_all(goal, cfg, pp_state.current_runs(pp_state.load(goal)))
+    # After the run records, because a probe's record is finalised as a run and
+    # the swarm it belonged to is closed as a unit.
+    try:
+        _reconcile_swarm(goal)
+    except Exception as exc:                                # noqa: BLE001
+        log(f"could not reconcile the interrupted swarm: "
+            f"{type(exc).__name__}: {exc}")
+
+
+def _exempt_honoured(state: dict, cfg: dict, exempt: bool) -> tuple[bool, int]:
+    """Is this run's exemption honoured, and how many preceded it?
+
+    The cap is checked against the count BEFORE this run, so probe_limit=2
+    honours exactly two consecutive exempt runs and counts the third. A swarm
+    asks the same question as a session, which is why it is asked in one place.
+    """
+    prior = int(state["breaker"].get("consecutive_exempt", 0))
+    return bool(exempt) and prior < int(cfg["probe_limit"]), prior
+
+
+def _apply_breaker(s: dict, *, honoured: bool, progressed: bool) -> None:
+    """The exempt / no-progress accounting. One implementation (invariant 1).
+
+    An exempt run neither increments NOR resets the no-progress counter. A
+    deliberate probe is not evidence of being stuck, and it is not evidence of
+    progress either — the honest answer is that it says nothing about whether
+    the goal is moving, so it leaves the breaker where it was. A swarm is one
+    such unit however many probes it ran, which is the whole reason this is
+    shared rather than copied.
+    """
+    if honoured:
+        s["breaker"]["consecutive_exempt"] = \
+            int(s["breaker"].get("consecutive_exempt", 0)) + 1
+    else:
+        s["breaker"]["consecutive_exempt"] = 0
+        s["breaker"]["consecutive_no_progress"] = (
+            0 if progressed else s["breaker"]["consecutive_no_progress"] + 1)
+
+
+def prepare_backend(goal: Path, cfg: dict, state: dict, n):
+    """Shared selection, recovery and telemetry for ordinary and swarm runs."""
+    decision = pp_routing.decide(cfg, state, pp_backend.load_config())
+    started = time.monotonic()
+    try:
+        spec = pp_backend.resolve(decision["selected"], allow_hosted=cfg["allow_hosted"])
+    except KeyError as exc:
+        log(f"⚠️ {exc}; falling back to the default class")
+        spec = pp_backend.resolve(None, allow_hosted=cfg["allow_hosted"])
+        decision["configuration_fallback"] = str(exc)
+    ok, detail = pp_backend.ensure(spec, goal=goal)
+    if not ok and detail.startswith("resource-busy:"):
+        return None, detail
+    if not ok:
+        log(f"backend {spec['class']} unusable: {detail}")
+        alt = pp_backend.escalation_for(spec["class"])
+        if alt:
+            failed = spec["class"]
+            decision["recovery"] = {"from": failed, "to": alt, "reason": detail}
+            spec = pp_backend.resolve(alt, allow_hosted=cfg["allow_hosted"])
+            ok, detail = pp_backend.ensure(spec, goal=goal)
+            pp_machine.event(goal, "backend-escalated", f"`{failed}` unusable; trying `{alt}`.",
+                             run=n, from_class=failed, to_class=alt, detail=detail[:300], ok=ok)
+    decision["load_and_probe_s"] = round(time.monotonic() - started, 3)
+    decision["ready"] = ok
+    pp_routing.record(goal, decision, spec, run_id(n))
+    if not ok:
+        return None, detail if detail.startswith("resource-busy:") else f"backend-unavailable:{detail}"
+    def routed(s):
+        rt = s.setdefault("routing", {})
+        previous = rt.get("last_backend", cfg.get("default_backend") or pp_backend.load_config().get("default_class"))
+        if decision["mode"] == "auto" and not decision["explicit"] and not decision.get("recovery") and previous != spec["class"]:
+            rt["quality_switches"] = int(rt.get("quality_switches", 0)) + 1
+            rt["last_quality_switch_run"] = n
+        rt["last_backend"] = spec["class"]
+        rt["last_decision"] = decision
+    pp_state.patch(goal, routed)
+    log(f"backend ready: {spec['class']} — probe said {detail!r}")
+    return spec, detail
+
+
+def one_run(goal: Path, cfg: dict) -> str:
+    """Run one session end to end. Returns an outcome keyword."""
+    state = pp_state.load(goal)
+    if pp_state.current_runs(state):
+        # Belt and braces: recover() clears these at startup, so reaching here means
+        # something reintroduced one mid-loop. Allocating N+1 on top of it is the
+        # bug that loses a session's whole handoff, so reconcile instead.
+        _finalize_all(goal, cfg, pp_state.current_runs(state))
+        state = pp_state.load(goal)
+
+    n = state["run"] + 1
+    rd = run_dir(goal, n)
+    rd.mkdir(parents=True, exist_ok=True)
+
+    # #9: the previous pass through the loop may have armed this run as the
+    # periodic audit. It is an ordinary session in every respect but two — it is
+    # exempt from the no-progress breaker, and the persona and nudge it borrows
+    # are handed back when it ends.
+    audit = _audit_record(state, "audit")
+    armed = _to_int(audit.get("run"))
+    if armed and armed < n:
+        # The armed session never completed (a crash, a wedge, a supervisor
+        # restart between the arming and the launch). Give the persona back
+        # before anything reads it, or the goal stays staffed by an auditor.
+        log(f"audit armed for run {armed} never ran — restoring the standing persona")
+        state = pp_state.patch(goal, _audit_restore(audit, run=armed,
+                                                    reason="not-completed"))
+        audit = {}
+    is_audit = armed == n
+
+    nxt = state.get("next", {})
+    persona = state.get("persona")
+    resume_id = nxt.get("session_id")
+    resume_reason = nxt.get("resume_reason")
+    nudge = nxt.get("nudge")
+
+    # ── backend ──
+    spec, detail = prepare_backend(goal, cfg, state, n)
+    if spec is None:
+        return detail
+
+    session_id = resume_id or str(uuid.uuid4())
+
+    # Snapshotted BEFORE the briefing is built, so what gets marked delivered is
+    # exactly what the briefing could have contained. An answer that lands in
+    # the seconds between build and launch must not be marked seen by a session
+    # that was never handed it — the same rule the board cursor lives by.
+    delivered_answers = [r["n"] for r in pp_human.undelivered_answers(goal)]
+    delivered_questions = [r["n"] for r in pp_human.open_questions(goal)]
+
+    briefing, briefing_upto, dropped = pp_briefing.build(
+        goal, state, spec, run_n=n, persona=persona,
+        allow_hosted=cfg["allow_hosted"], resume_reason=resume_reason,
+        budget_s=int(pp_routing.run_config(cfg, spec)["session_timeout_s"]),
+        no_progress_limit=int(cfg["no_progress_limit"]),
+        probe_limit=int(cfg["probe_limit"]),
+        max_chars=cfg["briefing_max_chars"])
+    briefing_file = rd / "briefing.md"
+    briefing_file.write_text(briefing, encoding="utf-8")
+    # Without the number, a budget that has quietly started eating the board is
+    # indistinguishable from a board nobody is posting to.
+    # …and without the LIMIT beside it, a briefing that fits looks identical to
+    # one that was cut to fit. Nine consecutive runs logged "sections dropped:
+    # wiki, board, machine, persona" and nothing said what they were dropped to.
+    _allowed = pp_briefing.allowance(spec, cfg["briefing_max_chars"])
+    log(f"briefing: {len(briefing)} chars of {_allowed} allowed "
+        f"({spec['class']}, {spec.get('context_tokens') or '?'} tok window)"
+        + (f", sections dropped: {', '.join(dropped)}" if dropped else ""))
+    def start(s):
+        s["run"] = n
+        s["status"] = pp_state.STATUS_RUNNING
+        pp_state.upsert_current_run(s, run_id(n), {
+            "n": n, "session_id": session_id, "backend": spec["class"],
+            "persona": persona, "started_at": now_iso(), "resumed": bool(resume_id)})
+        pp_state.reset_next(s)
+    state = pp_state.patch(goal, start)
+
+    before = fingerprint(goal, n)
+    # The commit the workspace was on when this session started. `commits_this
+    # run` in the handoff's evidence is measured against it, so it has to be
+    # written before the agent can touch anything.
+    base_commit = subprocess.run(
+        ["git", "-C", str(goal / "workspace"), "rev-parse", "HEAD"],
+        capture_output=True, text=True).stdout.strip() or None
+    write_json(rd / "start.json", {"run": n, "commit": base_commit,
+                                   "at": now_iso(), "session_id": session_id,
+                                   "backend": spec["class"], "persona": persona})
+
+    def delivered():
+        # A written briefing is not a delivered briefing. Move the cursor only
+        # once the child/window really exists, so a refused launch cannot hide the
+        # messages from the next real session.
+        pp_briefing.advance_cursor(goal, briefing_upto)
+        pp_human.mark_seen(goal, delivered_answers, run_id(n), of="answer")
+        pp_human.mark_seen(goal, delivered_questions, run_id(n), of="question")
+
+    code, reason = launch_pi(
+        goal, cfg, n, spec, persona, session_id, briefing_file,
+        pp_briefing.kickoff(state, n, nudge, resume_reason),
+        on_claim=lambda info: _record_active(goal, run_id(n), {"n": n, **info}),
+        on_launched=delivered)
+    # Deliberately NOT in a `finally`. If launch_pi unwinds because a signal
+    # arrived, the pi process is still running and ACTIVE is the only handle on
+    # it — clearing it there would hand the exception to a cleanup with nothing
+    # left to clean, which is exactly how a stopped supervisor used to leave a
+    # session alive. We only stop owning the run once it has actually finished.
+    _forget_active(run_id(n))
+    log(f"pi exited: code={code} watchdog={reason}")
+
+    exit_info = read_json(rd / "exit.json", {}) or {}
+    wedge = read_json(rd / "wedge.json")
+    write_json(rd / "run.json", {
+        # The canonical id, matching what finalize_interrupted_run writes for an
+        # interrupted run and what a probe writes for itself. Before D4 a clean
+        # run stored the int and the other two stored the string, so `run` had
+        # two types depending on how the run had ended.
+        "run": run_id(n), "session_id": session_id, "backend": spec["class"],
+        "persona": persona, "exit_code": code, "watchdog": reason,
+        "exit": exit_info, "wedged": bool(wedge), "ended_at": now_iso(),
+        "resumed": bool(resume_id),
+    })
+
+    # ── wedge: heal the server and resume THIS session ──
+    if wedge:
+        log(f"wedge detected (repeating {wedge.get('char')!r}) — healing {spec['class']}")
+        healed, hdetail = pp_backend.heal(spec)
+        log(f"heal: {'ok' if healed else 'FAILED'} — {hdetail}")
+        pp_machine.event(
+            goal, "wedge-healed" if healed else "wedge-heal-failed",
+            f"Run {n} collapsed into a repeating {wedge.get('char')!r}. The backend "
+            f"`{spec['class']}` was restarted ({'ok' if healed else 'FAILED'}) and the "
+            f"session is being resumed with its context intact.",
+            run=n, backend=spec["class"], detail=hdetail[:300])
+
+        def after_wedge(s):
+            s["status"] = pp_state.STATUS_IDLE
+            pp_state.drop_current_run(s, run_id(n))
+            s["stats"]["wedges_healed"] = s["stats"].get("wedges_healed", 0) + (1 if healed else 0)
+            s["breaker"]["consecutive_wedges"] += 1
+            s["next"]["session_id"] = session_id            # resume, context intact
+            s["next"]["resume_reason"] = (
+                "Your previous turn collapsed into a repeating character. That was a "
+                "server-side fault (a corrupted prompt-state cache), not something you "
+                "did — the model server has been restarted and this session resumed with "
+                "your context intact. Retry the step you were on, but do not re-send the "
+                "same very large prompt; work in smaller pieces.")
+            if s["breaker"]["consecutive_wedges"] >= 2:
+                alt = pp_backend.escalation_for(spec["class"])
+                if alt:
+                    s["next"]["backend"] = alt
+                    s["next"]["resume_reason"] += (
+                        f" This has now happened twice, so the backend is being changed "
+                        f"to {alt}.")
+        pp_state.patch(goal, after_wedge)
+        return "wedged"
+
+    # ── runaway turn: stopped before pi threw it away — resume THIS session ──
+    # The supervisor killed the run mid-generation because one turn was about to
+    # hit its output ceiling, where pi discards the whole turn. Not a server
+    # fault (so no heal) and not the session's failure (so no failure count) —
+    # just the wrong shape of write. Resume with the context intact and a nudge.
+    runaway = read_json(rd / "runaway.json")
+    if runaway:
+        streak = int(state["breaker"].get("consecutive_runaway", 0)) + 1
+        log(f"run {n}: runaway turn #{streak} at {runaway.get('n_decoded')} tokens "
+            f"(session {session_id[:8]})")
+        pp_machine.event(
+            goal, "runaway-turn",
+            f"Run {n} was generating a single turn past {runaway.get('limit')} "
+            f"tokens — heading for pi's per-turn output ceiling, where the whole "
+            f"turn is discarded with no file and no transcript. It was stopped "
+            f"and the session is being resumed with its context intact.",
+            run=n, backend=spec["class"], n_decoded=runaway.get("n_decoded"),
+            streak=streak)
+        if streak >= 3:
+            def bump_runaway(s):
+                s["breaker"]["consecutive_runaway"] = streak
+            pp_state.patch(goal, bump_runaway)
+            msg = (f"⛔ perpetua '{goal.name}' paused: session {session_id[:8]} ran "
+                   f"away generating an oversized turn {streak} times in a row. "
+                   f"Something is making it retry the same huge write.\nResume "
+                   f"with: perpetua resume {goal.name}")
+            _pause(goal, "runaway-loop", text=msg)
+            log(msg)
+            pp_notify.notify(msg, enabled=cfg["notify"])
+            return "runaway-paused"
+
+        def after_runaway(s):
+            s["status"] = pp_state.STATUS_IDLE
+            pp_state.drop_current_run(s, run_id(n))
+            s["breaker"]["consecutive_runaway"] = streak
+            s["next"]["session_id"] = session_id
+            s["next"]["resume_reason"] = (
+                "Your previous turn was stopped by the supervisor: it was "
+                "generating one very large response — a whole file or a long "
+                "block emitted in a single tool call — and was about to reach "
+                "the model's per-turn output limit, at which point pi throws the "
+                "entire turn away (no file written, no error). Your context is "
+                "intact. Redo that step in small pieces: create the file as a "
+                "short stub, then append each function or section with its own "
+                "edit. Never write a whole motion file in one call.")
+            if streak == 2:
+                s["next"]["resume_reason"] += (
+                    " This is the second time in a row — if the next write is "
+                    "still one big call the goal will pause for a human.")
+        pp_state.patch(goal, after_runaway)
+        return "runaway"
+
+    # ── handoff: written by the agent, or reaped ──
+    handoff_written = pp_journal.has_handoff(goal, n)
+    if not handoff_written:
+        if _never_launched(session_id, reason):
+            # Same as the probe path: no process ran, so there is no transcript
+            # to summarise and the box-wide session glob would find nothing.
+            log(f"run {n} never launched ({reason}) — not reaping")
+            data = {
+                "source": "reaper-skeleton",
+                "done": [], "learned": [],
+                "next_steps": ["Nothing was attempted — treat the work as still "
+                               "open, and check the supervisor log for why the "
+                               "launch failed before assuming the goal is at "
+                               "fault."],
+                "blockers": [f"Run {n} never started: {reason} (exit {code}). "
+                             f"No session ran, so there is nothing to read."],
+                "open_questions": [],
+            }
+        else:
+            log("no handoff written — running the reaper")
+            data = pp_reaper.reap(session_id, spec, cwd=goal / "workspace",
+                                  base_commit=_base_commit(goal, n))
+        data.update({"run": n, "session_id": session_id, "persona": persona,
+                     "backend": spec["class"],
+                     "reason": f"no handoff ({reason}, exit {code})"})
+        pp_journal.write_handoff(goal, n, data)
+        pp_machine.event(
+            goal, "session-reaped",
+            f"Run {n} ended without writing its own handoff ({reason}, exit {code}). "
+            f"What you inherit from it was reconstructed from its transcript by a "
+            f"summariser, so treat it as a lead rather than as a report.",
+            run=n, watchdog=reason, exit_code=code, backend=spec["class"])
+
+    kind = exit_info.get("kind")
+    # The fingerprint MUST be taken before attest/commit write anything. It is
+    # safe here because knowledge_digest(exclude_run=n) drops journal/NNNN.md and
+    # runs/NNNN/handoff.json is not in KNOWLEDGE_GLOBS at all — so attestation
+    # cannot forge the very progress signal it is attesting to. A refactor that
+    # moves either write above this line breaks that; test_attestation pins it.
+    after = fingerprint(goal, n)
+    progressed = after != before
+
+    handoff = read_json(pp_journal.handoff_path(goal, n), {}) or {}
+    # An audit is exempt by construction, not by asking the session to declare
+    # itself one: it was sent to verify rather than to advance, so a session that
+    # correctly changes nothing must not be counted as a session that got stuck.
+    # It reuses #5's exemption (including its consecutive cap) rather than
+    # inventing a second accounting rule.
+    exempt = bool(handoff.get("exempt_progress")
+                  or exit_info.get("exempt_progress") or is_audit)
+    flags = pp_journal.flags_for(handoff, progressed=progressed,
+                                 workspace=goal / "workspace")
+    pp_journal.attest(goal, n, {"progressed": progressed, "flags": flags,
+                                "exempt": exempt})
+    pp_journal.commit(goal, n)               # must come AFTER attest
+    if flags:
+        log(f"attestation flags for run {n}: {', '.join(flags)}")
+
+    def finish(s):
+        s["status"] = pp_state.STATUS_IDLE
+        pp_state.drop_current_run(s, run_id(n))
+        s["stats"]["runs_completed"] = s["stats"].get("runs_completed", 0) + 1
+        if handoff_written:
+            s["stats"]["sessions_ended_cleanly"] = s["stats"].get("sessions_ended_cleanly", 0) + 1
+        else:
+            s["stats"]["reaped"] = s["stats"].get("reaped", 0) + 1
+        s["breaker"]["consecutive_wedges"] = 0
+        s["breaker"]["consecutive_runaway"] = 0
+        if handoff_written:
+            s["breaker"]["consecutive_failures"] = 0
+        else:
+            s["breaker"]["consecutive_failures"] += 1
+        _apply_breaker(s, honoured=honoured, progressed=progressed)
+    honoured, prior_exempt = _exempt_honoured(state, cfg, exempt)
+    if exempt and not honoured:
+        pp_machine.event(
+            goal, "probe-exemption-exhausted",
+            f"Run {n} ended `{handoff.get('reason')}`, but the last {prior_exempt} "
+            f"sessions were already exempt (the cap is {cfg['probe_limit']}). This "
+            f"one counts against the no-progress breaker like any other run.",
+            run=n, prior_exempt=prior_exempt, limit=int(cfg["probe_limit"]))
+        log(f"probe exemption exhausted at run {n} ({prior_exempt} in a row)")
+    state = pp_state.patch(goal, finish)
+
+    # Before the no-progress branch, so that an audit whose exemption was
+    # exhausted can still be rotated off by the breaker rather than having the
+    # restore put the auditor straight back.
+    if is_audit:
+        state = pp_state.patch(goal, _audit_restore(
+            audit, run=n, reason=handoff.get("reason") or "no-handoff"))
+        log(f"audit run {n} finished — standing persona restored to "
+            f"{audit.get('restore_persona') or 'generalist'}")
+        pp_machine.event(
+            goal, "audit-complete",
+            f"Run {n} audited runs {audit.get('since', 0) + 1}-{audit.get('upto')} "
+            f"and ended `{handoff.get('reason') or 'without a handoff'}`. The "
+            f"standing persona is "
+            f"`{audit.get('restore_persona') or 'generalist'}` again.",
+            run=n, since=audit.get("since"), upto=audit.get("upto"))
+
+    # ── no progress: change something rather than repeating the same session ──
+    # An exempt run is also skipped here: inheriting "the last 3 sessions changed
+    # nothing" is precisely the pressure the exemption was granted against.
+    stuck = state["breaker"]["consecutive_no_progress"]
+    if not honoured and stuck >= cfg["no_progress_limit"]:
+        # #4: rotate to whichever OTHER persona's own queryable record shows
+        # the best progress rate on this goal — not blindly to the next name
+        # in the list, which let an unlucky ordering keep cycling through
+        # personas that had already been shown not to work. An unproven
+        # persona stays reachable (a neutral prior, not a zero), and ties
+        # favour the one used least recently, so an early lucky streak cannot
+        # monopolise the goal forever.
+        alt_persona = pp_persona.choose_rotation(goal, exclude=persona)
+
+        def unstick(s):
+            s["next"]["nudge"] = (
+                f"The last {stuck} sessions changed nothing measurable. "
+                f"{pp_progress.describe()} Do not continue the previous approach. "
+                f"First diagnose why the goal is stuck, write that diagnosis to the board, "
+                f"and try a different line of attack.")
+            if alt_persona:
+                s["persona"] = alt_persona
+            s["breaker"]["consecutive_no_progress"] = 0
+        pp_state.patch(goal, unstick)
+        log(f"no progress for {stuck} runs — nudging"
+            + (f" and switching persona to {alt_persona}" if alt_persona else ""))
+        pp_machine.event(
+            goal, "no-progress-nudge",
+            f"{stuck} sessions in a row changed nothing measurable, so the next one "
+            f"is told to diagnose why before continuing"
+            + (f", and the standing persona was rotated to `{alt_persona}`."
+               if alt_persona else "."),
+            run=n, stuck=stuck, persona_rotated_to=alt_persona)
+
+    if kind == "switch_backend":
+        return "switched"
+    return "ok" if handoff_written else "reaped"
+
+
+# ── the loop ──────────────────────────────────────────────────────────────
+def _install_signal_handlers() -> None:
+    def handler(signum, _frame):
+        # Raising out of the handler unwinds through every `finally`, which is how
+        # the in-flight pi gets killed and the lock released. Setting a flag would
+        # not: the supervisor spends nearly all its life blocked in a sleep inside
+        # launch_pi's watchdog loop, and the flag would not be looked at for
+        # minutes after systemd had already moved on to SIGKILL.
+        raise Stopping(f"signal {signal.Signals(signum).name}")
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, handler)
+
+
+def _pause(goal: Path, reason: str, *, text: str | None = None) -> None:
+    def apply(s):
+        s["status"] = pp_state.STATUS_PAUSED
+        s["breaker"]["paused_reason"] = reason
+        s["breaker"]["paused_at"] = now_iso()
+    pp_state.patch(goal, apply)
+    # No trip-wire may outlive a paused goal: watchers are agent-authored code
+    # the supervisor runs, and a paused goal has no supervisor to keep them in
+    # bounds. Revoking all of them HERE is what makes pause/accomplish the end
+    # of every watcher story.
+    pp_watch.revoke_all(goal, by="goal-paused")
+    # Posted as well as logged: a session woken by `perpetua resume` days later
+    # otherwise has no way to find out why it stopped.
+    pp_machine.event(goal, "goal-paused",
+                     f"The goal was paused and will not run again until a human "
+                     f"clears it: {reason}", reason=reason)
+    # #3: every pause opens a durable escalation at WARN. `notify()` already
+    # fired once at the call site (unchanged); this is what lets a startup
+    # later on notice nobody acknowledged it and bump the severity — the
+    # answer to a goal that paused at 2am with the phone on silent.
+    try:
+        pp_escalate.open_escalation(goal, kind=reason, level=pp_notify.WARN,
+                                    text=text or reason)
+    except Exception as exc:                            # noqa: BLE001
+        log(f"escalation not opened for pause {reason!r}: "
+            f"{type(exc).__name__}: {exc}")
+
+
+def _integrity_ok(goal: Path, goal_id: str, cfg: dict, state: dict,
+                  where: str) -> bool:
+    """Verify the fence; on violation, restore, post, notify and pause.
+
+    Returns True when the goal may keep running. Used BOTH before a session
+    (the preflight) and right after one (see the loop) — a fence moved mid-run
+    to make check.sh pass must not read as "accomplished", because there is no
+    next run to catch it. The pause, not the restore, is the point: the restore
+    only leaves the fence standing for the human who resumes.
+    """
+    outcome = pp_integrity.verify(goal)
+    for name in outcome.explained:
+        log(f"integrity: {name} changed to exactly an approved amendment — "
+            f"re-anchored the recorded hash")
+    if not outcome.violations:
+        return True
+    names = ", ".join(f"{v['name']} ({v['detail']})" for v in outcome.violations)
+    for vio in outcome.violations:
+        pp_machine.event(
+            goal, "integrity-violation",
+            f"The {vio['name']} file was tampered with or removed "
+            f"({vio['detail']}) {where}. It has been restored from "
+            f"{goal / '.integrity'} and the goal is paused until a human looks.",
+            run=state.get("run"), name=vio["name"])
+        log(f"integrity violation {where}: {vio['name']} ({vio['detail']})")
+    msg = (f"⛔ perpetua '{goal_id}' paused: integrity violation {where} — "
+           f"{names}. The protected files were restored from .integrity/ and "
+           f"the goal is paused: a fence that moves stops the goal. "
+           f"Resume it with: perpetua resume {goal_id}")
+    log(msg)
+    _pause(goal, f"integrity-violation:{names}", text=msg)
+    pp_notify.notify(msg, enabled=cfg["notify"])
+    return False
+
+
+
+# ── #7: the swarm ─────────────────────────────────────────────────────────
+# A swarm is ONE run of the goal carried out by K parallel sessions. Run N's
+# probes are N.1 … N.K, they each work in their own git worktree, and together
+# they count as a single exempt unit against the breaker. See lib/pp_swarm.py
+# for why each of those three things is the way it is.
+
+
+def _base_commit(goal: Path, n) -> str | None:
+    """The workspace HEAD when run `n` started, from its start.json."""
+    rec = read_json(run_dir(goal, n) / "start.json", {}) or {}
+    sha = rec.get("commit")
+    return str(sha) if sha else None
+
+
+def _never_launched(session_id: str, reason: str) -> bool:
+    """Did this probe fail before pi ever ran? Then there is no session to read.
+
+    The three spellings the swarm can produce for "no process happened": the
+    launch raised before a session id was used, the thread never recorded a
+    result at all, or launch_pi itself refused. Anything else — a crash, a
+    timeout, a wedge — did run, and its transcript is worth the reaper.
+    """
+    # `in`, not `startswith`: launch_pi's own refusal is spelt
+    # "tmux-launch-failed", which a prefix test misses — and that is the exact
+    # path C1 put every probe down, so the guard would have been absent from
+    # the failure it was written for.
+    return (not session_id
+            or reason == "never-ran"
+            or "launch-failed" in reason)
+
+
+def _finish_probe(goal: Path, cfg: dict, spec: dict, pn: str, session_id: str,
+                  persona: str | None, code: int, reason: str) -> dict:
+    """Close one probe's books: its run record, and a handoff if it wrote none.
+
+    Deliberately does NOT commit the journal entry — that writes inside
+    KNOWLEDGE_GLOBS, and the swarm's progress fingerprint has to be taken while
+    the journal still looks the way it did before the swarm ran (invariant 3).
+    `_commit_probe` does that half, after the measurement.
+    """
+    rd = run_dir(goal, pn)
+    rd.mkdir(parents=True, exist_ok=True)
+    exit_info = read_json(rd / "exit.json", {}) or {}
+    write_json(rd / "run.json", {
+        "run": pn, "session_id": session_id, "backend": spec["class"],
+        "persona": persona, "exit_code": code, "watchdog": reason,
+        "exit": exit_info, "wedged": bool(read_json(rd / "wedge.json")),
+        "ended_at": now_iso(), "probe": True,
+    })
+    if not pp_journal.has_handoff(goal, pn):
+        if _never_launched(session_id, reason):
+            # D6 W4: a probe that never started has no transcript to summarise,
+            # so reaping it can only ever produce the generic "no readable
+            # transcript" skeleton — after a glob over every pi session on the
+            # box, K times per swarm. Say the true thing instead, which is also
+            # the more useful thing: the launch failed, and here is how.
+            log(f"probe {pn} never launched ({reason}) — not reaping")
+            data = {
+                "source": "reaper-skeleton",
+                "done": [], "learned": [],
+                "next_steps": ["Nothing was attempted on this branch — treat the "
+                               "work as still open."],
+                "blockers": [f"Probe {pn} never started: {reason} (exit {code}). "
+                             f"No session ran, so there is nothing to read."],
+                "open_questions": [],
+            }
+            pp_journal.write_handoff(goal, pn, {**data, "run": pn,
+                                                "session_id": session_id,
+                                                "persona": persona,
+                                                "backend": spec["class"],
+                                                "reason": f"never launched ({reason})"})
+            return read_json(pp_journal.handoff_path(goal, pn), {}) or {}
+        log(f"probe {pn} wrote no handoff — reaping")
+        try:
+            # `pn`, not `n`: this is the probe's own run dir, and `n` is not even
+            # in scope here. launch_pi writes a start.json for whatever run id it
+            # was given, so the probe has its own base commit.
+            data = pp_reaper.reap(session_id, spec, cwd=goal / "workspace",
+                                  base_commit=_base_commit(goal, pn))
+        except Exception as exc:                            # noqa: BLE001
+            # A probe with no handoff is bad; a swarm that dies because one
+            # probe's reaper failed is worse. Invariant 7.
+            log(f"probe {pn}: reaper failed: {type(exc).__name__}: {exc}")
+            data = {"done": [], "learned": [],
+                    "next_steps": ["the reaper could not read this probe"]}
+        data.update({"run": pn, "session_id": session_id, "persona": persona,
+                     "backend": spec["class"],
+                     "reason": f"no handoff ({reason}, exit {code})"})
+        pp_journal.write_handoff(goal, pn, data)
+    return read_json(pp_journal.handoff_path(goal, pn), {}) or {}
+
+
+def _commit_probe(goal: Path, pn: str, handoff: dict, *, progressed: bool) -> None:
+    """Attest and render one probe's journal entry. After the fingerprint."""
+    try:
+        flags = pp_journal.flags_for(handoff, progressed=progressed,
+                                     workspace=goal / "workspace")
+        pp_journal.attest(goal, pn, {"progressed": progressed, "flags": flags,
+                                     "exempt": True, "probe": True})
+        pp_journal.commit(goal, pn)
+    except Exception as exc:                                # noqa: BLE001
+        log(f"probe {pn}: could not render its journal entry: "
+            f"{type(exc).__name__}: {exc}")
+
+
+def _close_previous_swarm(goal: Path, state: dict) -> None:
+    """Destroy the previous swarm's worktrees and branches, once it is spent.
+
+    Not at the end of its own swarm: the session that synthesises swarm N runs
+    *after* it, and deleting the branches before it has read them would throw
+    away the only durable form of what the probes did. By the time a second
+    swarm starts, the synthesis has had its turn.
+    """
+    prev = state.get("swarm_last")
+    if not isinstance(prev, dict) or not prev.get("run"):
+        return
+    for probe in pp_probe.list_probes(goal, prev["run"]):
+        try:
+            pp_probe.destroy(goal, prev["run"], probe["k"])
+        except Exception as exc:                            # noqa: BLE001
+            log(f"could not destroy probe {prev['run']}.{probe['k']}: "
+                f"{type(exc).__name__}: {exc}")
+
+
+def run_swarm(goal: Path, cfg: dict) -> str:
+    """Run one swarm end to end. Returns an outcome keyword, like one_run."""
+    state = pp_state.load(goal)
+    if pp_state.current_runs(state):
+        _finalize_all(goal, cfg, pp_state.current_runs(state))
+        state = pp_state.load(goal)
+
+    n = state["run"] + 1
+    nid = run_id(n)
+    rd = run_dir(goal, n)
+    rd.mkdir(parents=True, exist_ok=True)
+
+    spec, detail = prepare_backend(goal, cfg, state, n)
+    if spec is None:
+        return detail
+
+    k, note = pp_swarm.clamp_k(cfg, spec)
+    if note:
+        log(f"swarm: {note}")
+    if k < 1:
+        return "swarm-disabled"
+
+    _close_previous_swarm(goal, state)
+
+    persona = state.get("persona")
+    probes = []
+    for i in range(1, k + 1):
+        try:
+            # destroy-then-create: pp_probe.create refuses an existing probe
+            # rather than reusing a worktree that may hold a dead probe's files.
+            pp_probe.destroy(goal, n, i)
+            probes.append(pp_probe.create(goal, n, i))
+        except Exception as exc:                            # noqa: BLE001
+            log(f"swarm: could not create probe {nid}.{i}: "
+                f"{type(exc).__name__}: {exc}")
+    if not probes:
+        return "swarm-no-probes"
+    log(f"swarm run {nid}: {len(probes)} probe(s) on {spec['class']}")
+
+    def start(s):
+        s["run"] = n
+        s["status"] = pp_state.STATUS_RUNNING
+        s["swarm"] = {"run": n, "k": len(probes), "started_at": now_iso(),
+                      "branches": [p["branch"] for p in probes]}
+        pp_state.reset_next(s)
+    state = pp_state.patch(goal, start)
+
+    before = fingerprint(goal, n)
+    write_json(rd / "swarm.json", {"run": n, "k": len(probes), "at": now_iso(),
+                                   "backend": spec["class"],
+                                   "probes": probes, "note": note})
+
+    results: dict[str, tuple[int, str, str]] = {}
+    lock = threading.Lock()
+
+    def one_probe(p: dict) -> None:
+        pn = f"{nid}.{p['k']}"
+        session_id = str(uuid.uuid4())
+        prd = run_dir(goal, pn)
+        prd.mkdir(parents=True, exist_ok=True)
+        try:
+            briefing, _upto, _dropped = pp_briefing.build(
+                goal, state, spec, run_n=pn, persona=persona,
+                allow_hosted=cfg["allow_hosted"],
+                budget_s=pp_routing.run_config(cfg, spec)["session_timeout_s"],
+                no_progress_limit=int(cfg["no_progress_limit"]),
+                probe_limit=int(cfg["probe_limit"]),
+                max_chars=cfg["briefing_max_chars"])
+            # The briefing cursor is deliberately NOT advanced by a probe. K
+            # probes reading the same board must not consume each other's
+            # messages, and the synthesis session still needs to see them.
+            briefing += pp_swarm.PROBE_BRIEFING_EXTRA.format(
+                k=p["k"], total=len(probes), n=nid, branch=p["branch"])
+            bf = prd / "briefing.md"
+            bf.write_text(briefing, encoding="utf-8")
+            code, reason = launch_pi(
+                goal, cfg, pn, spec, persona, session_id, bf,
+                pp_briefing.kickoff(state, pn, None, None),
+                on_claim=lambda info, _pn=pn: _record_active(
+                    goal, _pn, {"n": _pn, **info}),
+                cwd=Path(p["worktree"]), role="probe")
+        except Exception as exc:                            # noqa: BLE001
+            log(f"probe {pn} failed to launch: {type(exc).__name__}: {exc}")
+            code, reason = -1, f"launch-failed: {exc}"
+        finally:
+            _forget_active(pn)
+        with lock:
+            results[pn] = (code, reason, session_id)
+
+    threads = [threading.Thread(target=one_probe, args=(p,), name=f"probe-{p['k']}")
+               for p in probes]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    handoffs = {}
+    for p in probes:
+        pn = f"{nid}.{p['k']}"
+        code, reason, session_id = results.get(pn, (-1, "never-ran", ""))
+        handoffs[pn] = _finish_probe(goal, cfg, spec, pn, session_id,
+                                     persona, code, reason)
+
+    # Measured BEFORE any probe journal entry is rendered: journal/*.md is inside
+    # KNOWLEDGE_GLOBS, so committing them first would let the swarm attest to
+    # progress it manufactured by writing about itself (invariant 3).
+    after = fingerprint(goal, n)
+    progressed = after != before
+    for pn, handoff in handoffs.items():
+        _commit_probe(goal, pn, handoff, progressed=progressed)
+
+    harvest = pp_probe.harvest(goal, n)
+    stat = pp_swarm.summarise(harvest)
+    # #5: the merge queue. `after`/`progressed` above were measured before this
+    # runs, on purpose — landing a probe's commits is the SUPERVISOR mechanically
+    # applying a gate, not any of the K sessions doing work, so it must not
+    # inflate what this swarm run itself is credited with; the session that
+    # inherits a cleaner workspace (the synthesis run right after) picks it up
+    # as its own before/after difference, honestly.
+    refined = pp_refine.harvest(goal, n, probes=harvest, harvest_path=rd / "harvest.json")
+    write_json(rd / "harvest.json", {"run": n, "at": now_iso(),
+                                     "summary": stat, "probes": harvest,
+                                     **refined})
+    refine_stat = pp_refine.summarise(refined)
+    log(f"swarm run {nid} done: {stat['productive']}/{stat['probes']} probe(s) "
+        f"left {stat['commits']} commit(s); merge queue landed "
+        f"{refine_stat['landed']}/{stat['probes']}, skipped {refine_stat['skipped']}")
+    if refine_stat["landed"]:
+        pp_machine.event(
+            goal, "swarm-harvest-landed",
+            f"The merge queue landed {refine_stat['landed']} probe branch(es) "
+            f"straight into the workspace: {', '.join(refine_stat['landed_branches'])}. "
+            f"Nothing else needs cherry-picking for those.",
+            run=n, landed=refine_stat["landed"], skipped=refine_stat["skipped"],
+            branches=refine_stat["landed_branches"])
+
+    # One exempt unit, however many probes ran — and it reuses #5's exemption
+    # including its consecutive cap, so a goal cannot swarm forever to keep the
+    # breaker asleep.
+    honoured, prior_exempt = _exempt_honoured(state, cfg, True)
+    if not honoured:
+        log(f"swarm run {nid}: exemption exhausted ({prior_exempt} in a row)")
+        pp_machine.event(
+            goal, "probe-exemption-exhausted",
+            f"Swarm run {n} is exempt by construction, but the last "
+            f"{prior_exempt} sessions were already exempt (the cap is "
+            f"{cfg['probe_limit']}). It counts against the no-progress breaker.",
+            run=n, prior_exempt=prior_exempt, limit=int(cfg["probe_limit"]))
+
+    # The synthesis session only needs to decide what to do about probes the
+    # merge queue could NOT already land for it — repeating the ones it did
+    # would waste the one thing #5 exists to save.
+    landed_branches = set(refine_stat["landed_branches"])
+    remaining = [p for p in harvest if p.get("branch") not in landed_branches]
+    nudge = pp_swarm.synthesis_nudge(nid, remaining)
+    if refine_stat["landed"]:
+        nudge = (f"**The merge queue already landed {refine_stat['landed']} probe "
+                 f"branch(es) into the workspace for you** — "
+                 f"{', '.join(refine_stat['landed_branches'])} — because each one "
+                 f"kept check.sh's result no worse than before it merged. Nothing "
+                 f"else to do for those; look at `runs/{nid}/harvest.json` for why "
+                 f"any others were skipped.\n\n" + nudge)
+
+    def finish(s):
+        s["status"] = pp_state.STATUS_IDLE
+        for p in probes:
+            pp_state.drop_current_run(s, f"{nid}.{p['k']}")
+        s["stats"]["runs_completed"] = s["stats"].get("runs_completed", 0) + 1
+        s["stats"]["swarms"] = s["stats"].get("swarms", 0) + 1
+        s["breaker"]["consecutive_wedges"] = 0
+        s["breaker"]["consecutive_runaway"] = 0
+        _apply_breaker(s, honoured=honoured, progressed=progressed)
+        s["swarm"] = None
+        s["swarm_last"] = {"run": n, "k": len(probes), "at": now_iso(),
+                           "summary": stat}
+        # The synthesis session is an ORDINARY run: deciding what survives is
+        # advancing the goal, so it is not exempt and it borrows no persona.
+        s.setdefault("next", {})["nudge"] = nudge
+    pp_state.patch(goal, finish)
+
+    pp_machine.event(
+        goal, "swarm-complete",
+        f"Run {n} was a swarm of {stat['probes']} parallel probe(s); "
+        f"{stat['productive']} left commits ({stat['commits']} in total) on "
+        f"their own branches. The next session synthesises them and decides "
+        f"what survives.",
+        run=n, k=stat["probes"], productive=stat["productive"],
+        commits=stat["commits"], branches=stat["branches"])
+    return "swarm"
+
+
+def supervise(goal_id: str, *, once: bool = False, max_runs: int | None = None) -> int:
+    goal = goal_dir(goal_id)
+    if not (goal / "state.json").exists():
+        log(f"no such goal: {goal}")
+        return 2
+    cfg = load_goal_cfg(goal)
+    if max_runs is not None:
+        cfg["max_runs"] = max_runs
+
+    # Ownership is an exclusive lock held for this process's whole lifetime, not a
+    # pidfile that is checked and then written. The old check-then-write left a
+    # window between "nobody owns it" and "I own it" in which a second supervisor
+    # could pass the same check, and a pidfile left behind by a SIGKILLed process
+    # would either block the goal forever or, if the pid had been recycled, be
+    # cleared by someone who did not own it. flock has neither problem: the kernel
+    # releases it when the fd closes, however the process died.
+    owner = lifetime_lock(goal / "supervisor.lock",
+                          {"goal": goal.name, "argv": sys.argv[1:]})
+    try:
+        owner.__enter__()
+    except LockBusy as exc:
+        held = exc.holder.get("pid")
+        log("another supervisor already owns this goal"
+            + (f" (pid {held}, since {exc.holder.get('since')})" if held else ""))
+        return EXIT_BUSY
+
+    try:
+        return _supervise_locked(goal, goal_id, cfg, once=once)
+    finally:
+        cleanup_active("supervisor exiting")
+        (goal / "supervisor.pid").unlink(missing_ok=True)
+        owner.__exit__(None, None, None)
+
+
+def _supervise_locked(goal: Path, goal_id: str, cfg: dict, *, once: bool) -> int:
+    _install_signal_handlers()
+    # The pidfile is now purely informational — the dashboard and `perpetua status`
+    # read it to show "supervising", and nothing decides ownership from it.
+    (goal / "supervisor.pid").write_text(f"{os.getpid()}\n")
+
+    state = pp_state.load(goal)
+    if state["status"] == pp_state.STATUS_ACCOMPLISHED:
+        log("goal is already accomplished; nothing to do")
+        return 0
+
+    # A pause is durable. It used to be cleared unconditionally at startup, which
+    # meant a paused goal on `Restart=on-failure` un-paused itself sixty seconds
+    # later and went straight back to hammering the backend it had just given up
+    # on. Only `perpetua resume` clears it.
+    paused_reason = (state.get("breaker") or {}).get("paused_reason")
+    if pp_state.is_paused(state):
+        log(f"goal is PAUSED: {paused_reason or 'no reason recorded'}")
+        # #3: staleness auto-bump lives HERE, in the supervisor's own startup
+        # path, and nowhere else — a paused goal exits before its loop ever
+        # starts, so "the supervisor started" is the only event a bump can
+        # ride on without a separate scheduler. Document the consequence: a
+        # paused unit is never restarted by systemd
+        # (RestartPreventExitStatus), so in practice this only fires when a
+        # human re-runs `perpetua start`/`enable`, or a box reboot re-starts
+        # an enabled unit. If that turns out to be too rare to matter,
+        # `perpetua escalate-check` runs the identical check with no
+        # supervisor lock at all, and a systemd timer can call it on a
+        # cadence — but the check itself lives in one place either way.
+        try:
+            bumped = pp_escalate.check_and_bump(
+                goal, stale_s=float(cfg["escalation_stale_s"]),
+                notify_enabled=cfg["notify"])
+            if bumped:
+                log(f"escalation bumped to {bumped['level']} "
+                    f"({bumped['bumps']} bump(s) so far) — still paused")
+        except Exception as exc:                            # noqa: BLE001
+            log(f"escalation staleness check failed: "
+                f"{type(exc).__name__}: {exc}")
+        log(f"it will not run until you clear it:  perpetua resume {goal_id}")
+        return EXIT_PAUSED
+
+    # Recovery may reconstruct a handoff using inference. It owns the same
+    # resource as normal execution before doing so.
+    while True:
+        try:
+            with pp_backend.lease(goal):
+                recover(goal, cfg)
+            break
+        except LockBusy:
+            pp_state.patch(goal, lambda s: s.update({"resource_wait": "recovery"}))
+            if once:
+                return EXIT_BUSY
+            time.sleep(2)
+    # A crash leaves an active interval. Reconciliation charges through restart
+    # conservatively; it never grants a fresh budget by restarting the service.
+    pp_control.usage_finish(goal, time.time())
+    state = pp_state.load(goal)
+    log(f"=== perpetua supervising '{goal_id}' from run {state['run'] + 1} ===")
+
+    started_runs = 0
+    inference_lease = None
+    try:
+        while True:
+            if inference_lease is not None:
+                inference_lease.__exit__(None, None, None)
+                inference_lease = None
+            state = pp_state.load(goal)
+            reason = pp_control.budget_reason(goal, cfg, state)
+            if state.get("pause_requested_at") or reason:
+                _pause(goal, reason or "operator requested pause after handoff")
+                return EXIT_PAUSED
+            # Legacy watchers tick between runs — this is the call that makes
+            # them fire at all while no session is running (the poll loop inside
+            # launch_pi covers the time a session IS running). pp_watch.tick
+            # never raises, so a broken watcher cannot stop the loop.
+            pp_watch.tick(goal)
+            # `is not None`, not truthiness: --max-runs 0 means "reconcile and
+            # stop without starting anything", which a falsy test turned into
+            # "unlimited" — the opposite.
+            if cfg["max_runs"] is not None and started_runs >= int(cfg["max_runs"]):
+                log(f"reached max_runs={cfg['max_runs']}")
+                return 0
+
+            # Integrity preflight (R1/R3). The human's fence and the completion
+            # predicate are hashed at `perpetua new` and re-verified before
+            # EVERY session. This is hash-and-detect, not refusal-in-pp-tool:
+            # the agent's cwd parents the goal directory, so `cd ..` reaches
+            # either file with plain bash — what makes tampering pointless is
+            # that the next run refuses to happen.
+            if not _integrity_ok(goal, goal_id, cfg, state, "before this run"):
+                return EXIT_PAUSED
+
+            # Preflight. Launching a session for a goal that is already finished
+            # burns a whole session (and, on a local model, an hour) to discover
+            # what one bash script could have said in a second — and risks the
+            # agent "improving" work that was already done.
+            pre = run_check(goal)
+            if not pre.ran:
+                msg = (f"⛔ perpetua '{goal_id}' paused: completion check could not "
+                       f"run safely: {pre.detail}\nResume it after fixing check.sh with: "
+                       f"perpetua resume {goal_id}")
+                log(msg)
+                _pause(goal, f"completion-check-unavailable:{pre.detail}", text=msg)
+                pp_notify.notify(msg, enabled=cfg["notify"])
+                return EXIT_PAUSED
+            if pre.passed:
+                # Verify-run-verify: the PASS must have come from the very file
+                # the hash verified, not a version swapped in between the two
+                # calls — a watcher's run.sh can write check.sh, and there is no
+                # next run to catch a lie declared accomplished here.
+                if not _integrity_ok(goal, goal_id, cfg, state,
+                                     "while checking completion"):
+                    return EXIT_PAUSED
+                log(f"check.sh already passes before run {state['run'] + 1} — "
+                    f"the goal is accomplished; not launching a session")
+                return _accomplished(goal, goal_id, cfg, state, pre.detail,
+                                     preflight=True)
+
+            # #7: a swarm is requested through `next`, the same channel a nudge
+            # or a backend switch uses, so a session can ask for one in its
+            # handoff and a human can ask for one with `perpetua swarm`. The
+            # request is cleared BEFORE the swarm runs, not after: a swarm that
+            # fails to create a single probe must not be retried forever by a
+            # flag its own failure left standing.
+            candidate_lease = pp_backend.lease(goal)
+            try:
+                candidate_lease.__enter__()
+            except LockBusy:
+                pp_state.patch(goal, lambda s: s.update({"resource_wait": "inference"}))
+                if once:
+                    return EXIT_BUSY
+                time.sleep(2)
+                continue
+            inference_lease = candidate_lease
+            pp_state.patch(goal, lambda s: s.pop("resource_wait", None))
+            pp_control.usage_start(goal, time.time())
+            if (state.get("next") or {}).get("swarm"):
+                def _clear_swarm(s):
+                    s.setdefault("next", {})["swarm"] = False
+                state = pp_state.patch(goal, _clear_swarm)
+                outcome = run_swarm(goal, cfg)
+            else:
+                outcome = one_run(goal, cfg)
+            pp_control.usage_finish(goal, time.time())
+            if outcome.startswith("resource-busy:"):
+                pp_state.patch(goal, lambda s: s.update({"resource_wait": outcome}))
+                if once:
+                    return EXIT_BUSY
+                inference_lease.__exit__(None, None, None)
+                inference_lease = None
+                time.sleep(2)
+                continue
+            started_runs += 1
+            log(f"run outcome: {outcome}")
+
+            # one_run may pause the goal itself (a runaway-turn loop). The pause
+            # and its notification are already written; the loop just has to stop.
+            if pp_state.is_paused(pp_state.load(goal)):
+                log(f"goal paused during run {state.get('run')} — stopping")
+                return EXIT_PAUSED
+
+            if outcome.startswith("backend-unavailable"):
+                def bump_failure(s):
+                    s["breaker"]["consecutive_failures"] += 1
+                state = pp_state.patch(goal, bump_failure)
+                backoff = cfg["backoff_s"]
+                fails = state["breaker"]["consecutive_failures"]
+                if fails >= len(backoff):
+                    msg = (f"⛔ perpetua '{goal_id}' paused: no usable model backend "
+                           f"after {fails} attempts.\nResume it with: "
+                           f"perpetua resume {goal_id}")
+                    log(msg)
+                    _pause(goal, outcome, text=msg)
+                    pp_notify.notify(msg, enabled=cfg["notify"])
+                    return EXIT_PAUSED
+                delay = backoff[min(fails, len(backoff) - 1)]
+                log(f"backing off {delay}s")
+                inference_lease.__exit__(None, None, None)
+                inference_lease = None
+                time.sleep(delay)
+                continue
+
+            state = pp_state.load(goal)
+            # Post-run integrity: a fence moved mid-run ("cd .. && edit check.sh"
+            # then end-session) must not read as accomplished — a goal stops
+            # only on an HONEST check, and there is no next run to catch the
+            # tamper.
+            if not _integrity_ok(goal, goal_id, cfg, state,
+                                 f"after run {state.get('run')}"):
+                return EXIT_PAUSED
+            if state["run"] % int(cfg["consolidate_every"] or 10) == 0:
+                log("consolidating the goal wiki")
+                spec = pp_backend.resolve(cfg["default_backend"],
+                                          allow_hosted=cfg["allow_hosted"])
+                consolidate(goal, spec)
+                # Same cadence, deliberately: consolidation is where the goal
+                # turns run-to-run notes into durable knowledge, and an audit of
+                # what those notes claimed belongs at exactly that moment.
+                schedule_audit(goal, cfg, spec, state)
+
+            result = run_check(goal)
+            log(f"check.sh: {'PASS' if result.passed else 'not yet'} — {result.detail[:200]}")
+            # Only on a TRANSITION. A check that has been red for forty sessions
+            # is not news, and posting it every run is how the machine channel
+            # would stop being read.
+            was = state.get("last_check_passed")
+            if result.ran and was is not None and bool(result.passed) != bool(was):
+                pp_machine.event(
+                    goal, "check-status-changed",
+                    f"check.sh went from {'PASS' if was else 'failing'} to "
+                    f"{'PASS' if result.passed else 'failing'} after run "
+                    f"{state.get('run')}: {result.detail[:300]}",
+                    run=state.get("run"), passed=bool(result.passed))
+            if result.ran:
+                def stamp_check(s):
+                    s["last_check_passed"] = bool(result.passed)
+                state = pp_state.patch(goal, stamp_check)
+            if not result.ran:
+                msg = (f"⛔ perpetua '{goal_id}' paused: completion check could not "
+                       f"run safely after run {state['run']}: {result.detail}\n"
+                       f"Resume it after fixing check.sh with: perpetua resume {goal_id}")
+                log(msg)
+                _pause(goal, f"completion-check-unavailable:{result.detail}", text=msg)
+                pp_notify.notify(msg, enabled=cfg["notify"])
+                return EXIT_PAUSED
+            if result.passed:
+                # Same verify-run-verify as the preflight gate: a fence moved
+                # mid-run to make check.sh pass must not read as accomplished.
+                if not _integrity_ok(goal, goal_id, cfg, state,
+                                     "while checking completion"):
+                    return EXIT_PAUSED
+                return _accomplished(goal, goal_id, cfg, state, result.detail)
+
+            # Blocked-on-human backstop (R3). A session that filed a charter
+            # amendment and then keeps getting launched is burning model time
+            # against a goal its own predecessor reported as mis-scoped — the
+            # ExploitGym dynamic. After three consecutive runs with an
+            # unresolved pending amendment the loop stops and says why, instead
+            # of silently spending more sessions.
+            # A question raised with `ask_human` counts the same way, and for
+            # the same reason: an amendment is "this goal is mis-scoped" and a
+            # question is "this decision is not mine to make", but a session
+            # launched against either one unanswered spends an hour of a local
+            # model re-deriving that it is blocked. On the first real goal that
+            # happened five times over, invisibly.
+            open_qs = pp_human.open_questions(goal)
+            pending = pp_amend.pending_count(goal) + len(open_qs)
+
+            def tally(s, has_pending=bool(pending)):
+                if has_pending:
+                    s["breaker"]["consecutive_pending"] = (
+                        int(s["breaker"].get("consecutive_pending", 0)) + 1)
+                else:
+                    s["breaker"]["consecutive_pending"] = 0
+            state = pp_state.patch(goal, tally)
+            if pending and state["breaker"]["consecutive_pending"] >= 3:
+                what = []
+                if pp_amend.pending_count(goal):
+                    what.append(f"{pp_amend.pending_count(goal)} amendment(s)")
+                if open_qs:
+                    what.append(f"{len(open_qs)} question(s) "
+                                f"(Q{', Q'.join(str(q['n']) for q in open_qs)})")
+                msg = (f"⛔ perpetua '{goal_id}' paused: {' and '.join(what)} "
+                       f"have been waiting on you for "
+                       f"{state['breaker']['consecutive_pending']} runs, and the "
+                       f"goal keeps launching sessions that can only rediscover "
+                       f"they are blocked on a decision nobody has made.\n"
+                       f"Review: perpetua inbox {goal_id}\n"
+                       f"Decide and resume with: perpetua resume {goal_id}")
+                log(msg)
+                pp_machine.event(
+                    goal, "blocked-on-human",
+                    f"{pending} amendment(s) unresolved for "
+                    f"{state['breaker']['consecutive_pending']} runs — pausing "
+                    f"so a human can decide.",
+                    pending=pending,
+                    consecutive=state["breaker"]["consecutive_pending"])
+                _pause(goal, "blocked-on-human-pending", text=msg)
+                pp_notify.notify(msg, enabled=cfg["notify"])
+                return EXIT_PAUSED
+
+            if once:
+                return 0
+
+            fails = state["breaker"]["consecutive_failures"]
+            if fails:
+                backoff = cfg["backoff_s"]
+                delay = backoff[min(fails, len(backoff) - 1)]
+                if delay:
+                    log(f"{fails} consecutive runs without a clean handoff — "
+                        f"backing off {delay}s")
+                    inference_lease.__exit__(None, None, None)
+                    inference_lease = None
+                    time.sleep(delay)
+
+    except Stopping as exc:
+        log(f"stopping: {exc}")
+        cleanup_active(str(exc))
+        return 143
+    finally:
+        cleanup_active("supervisor leaving inference lease")
+        pp_control.usage_finish(goal, time.time())
+        if inference_lease is not None:
+            inference_lease.__exit__(None, None, None)
+
+
+def _accomplished(goal: Path, goal_id: str, cfg: dict, state: dict, detail: str,
+                  *, preflight: bool = False) -> int:
+    def apply(s):
+        s["status"] = pp_state.STATUS_ACCOMPLISHED
+        s["phase"] = "accomplished"
+    pp_state.patch(goal, apply)
+    # Accomplished means no more sessions and no more supervisor: nothing
+    # agent-authored may keep running against a finished goal.
+    pp_watch.revoke_all(goal, by="goal-accomplished")
+    pp_machine.event(goal, "goal-accomplished",
+                     f"check.sh passed after {state.get('run', 0)} sessions"
+                     + (" (before this session started)" if preflight else "")
+                     + f": {detail[:300]}", preflight=preflight)
+    msg = (f"✅ perpetua goal '{goal_id}' accomplished after {state.get('run', 0)} sessions"
+           + (" (check.sh already passed before this session started)" if preflight else "")
+           + f".\ncheck.sh says: {detail[:400]}")
+    log(msg)
+    pp_notify.notify(msg, enabled=cfg["notify"])
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="perpetua supervisor")
+    ap.add_argument("goal_id")
+    ap.add_argument("--once", action="store_true", help="run a single session and stop")
+    ap.add_argument("--max-runs", type=int, default=None)
+    args = ap.parse_args()
+    try:
+        return supervise(args.goal_id, once=args.once, max_runs=args.max_runs)
+    except UnsafeGoalId as exc:
+        log(f"refusing that goal id: {exc}")
+        return 2
+    except (KeyboardInterrupt, Stopping):
+        # The handler normally unwinds inside _supervise_locked, which cleans up.
+        # This catches a signal that lands outside it (during startup or teardown).
+        log("interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

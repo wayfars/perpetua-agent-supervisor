@@ -1,0 +1,968 @@
+#!/usr/bin/env python3
+"""pp-tool — the write path for a running session.
+
+The pi extension is deliberately thin: it validates arguments, then shells out to
+this. Locking, the board's on-disk format, state mutation and the handoff schema
+therefore have exactly ONE implementation, shared with the CLI and the supervisor.
+A second copy in TypeScript would drift, and the failure would be silent
+corruption of the one thing that carries the goal between sessions.
+
+Usage:  pp-tool <subcommand> '<json payload>'
+Output: a single JSON object on stdout. Exit 0 on success, 1 with {"error": ...}.
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import pp_amend
+import pp_assign
+import pp_backend
+import pp_board
+import pp_briefing
+import pp_check
+import pp_escalate
+import pp_holds
+import pp_human
+import pp_journal
+import pp_orient
+import pp_persona
+import pp_recall
+import pp_notify
+import pp_state
+import pp_watch
+from pp_common import (UnsafeRunId, log, now_iso, read_json, run_dir,
+                       run_id, write_json)
+
+#: Names no session tool may ever write, however the path is spelled. Today only
+#: BOUNDARIES.md qualifies — check.sh is guarded by hash-and-detect in the
+#: supervisor, which is what makes tampering pointless even though `cd ..` can
+#: reach it — and the enforcement here is belt-and-braces anyway. The reason it
+#: is a LIST is so a future write path inherits the refusal by calling the
+#: helper, not by remembering to re-implement it.
+PROTECTED_FILES = ("BOUNDARIES.md",)
+
+
+def refuse_protected(goal: Path, path) -> None:
+    """Refuse a write target that resolves to a protected file.
+
+    The resolution happens BEFORE the comparison so `../BOUNDARIES.md` from the
+    agent's cwd (the goal's workspace) is refused exactly like the literal name
+    — a refusal that only matches the easy spelling would train the agent to
+    use the other one.
+    """
+    target = Path(path).resolve()
+    for name in PROTECTED_FILES:
+        if target == (goal / name).resolve():
+            raise ValueError(
+                f"refusing to write {name}: it is the human's fence and no "
+                f"session tool may touch it. If the goal needs a different "
+                f"boundary, say so in your handoff for the human to edit.")
+
+
+#: Commands only a live session may run. A watcher's env carries
+#: PERPETUA_GOAL_DIR but never PERPETUA_RUN, so without this a spawned run.sh
+#: could call end-session and write a handoff for a run that never happened —
+#: the one state a session is trusted to write.
+#: A watcher's run.sh has PERPETUA_GOAL_DIR but no PERPETUA_RUN, and these verbs
+#: all write something attributed to a session: a handoff, a criterion tick, or
+#: an identity's own record of what it did. A posthumous trigger must not be able
+#: to write history in a persona's name.
+SESSION_ONLY = frozenset({"end-session", "goal-state",
+                          "persona-dossier", "persona-handoff", "hold",
+                          # Added after D6: a watcher's run.sh has
+                          # PERPETUA_GOAL_DIR but no PERPETUA_RUN, and this verb
+                          # writes a handoff and patches next.backend — so a
+                          # posthumous trigger could redirect what the next real
+                          # session runs on. T5's SESSION_ONLY pass missed it and
+                          # D5 added `hold` beside it without noticing.
+                          "switch-backend"})
+WS_MSG = "needs a live session (PERPETUA_RUN) — watchers are not sessions"
+
+#: Verbs a swarm probe may not run (#7). A probe is one of K parallel sessions
+#: exploring the same problem, and most of them are meant to be thrown away —
+#: so it may report (the board), record its own findings (a handoff, a
+#: verification) and commit inside its own worktree, but it may not change
+#: anything the other probes or the goal itself inherit: no criterion ticks, no
+#: amendments, no persona edits or successions, no assignments, no watchers that
+#: would outlive it, and no touching the one backend all K are sharing.
+PROBE_FORBIDDEN = frozenset({
+    "goal-state", "amend-propose",
+    "persona-write", "persona-assign", "persona-dossier", "persona-handoff",
+    "assign-open", "assign-claim", "assign-resolve", "assign-comment",
+    "watch-register", "watch-revoke",
+    "hold", "switch-backend",
+    # K probes exploring one problem hit the same blocker at the same moment.
+    # Letting each raise it would put K identical questions in the ledger, K
+    # notifications in front of the human, and K reasons to pause the goal —
+    # for one decision. The synthesis session asks, once, if it still matters.
+    "ask-human",
+})
+PROBE_MSG = ("is refused to a swarm probe — a probe explores and reports, and "
+             "most probes are discarded. Say what you found in your handoff and "
+             "on the board; the synthesis session decides what becomes durable")
+
+
+def ctx() -> dict:
+    goal = os.environ.get("PERPETUA_GOAL_DIR")
+    if not goal:
+        raise RuntimeError("PERPETUA_GOAL_DIR is not set — not inside a perpetua run")
+    return {
+        "goal": Path(goal),
+        "run": os.environ.get("PERPETUA_RUN", "") or "0",
+        "persona": os.environ.get("PERPETUA_PERSONA") or None,
+        "backend": os.environ.get("PERPETUA_BACKEND_CLASS") or None,
+        "session_id": os.environ.get("PERPETUA_SESSION_ID") or None,
+    }
+
+
+def author(c: dict) -> str:
+    if c["persona"]:
+        return c["persona"]
+    agent_id = os.environ.get("PERPETUA_AGENT_ID", "").strip()
+    if agent_id and not _live_session_run(c["run"]):
+        # MCP clients have no Perpetua persona or run. Preserve their harness
+        # identity in board and assignment records instead of pretending they
+        # were run-0000. The server validates this value before invoking us.
+        return f"mcp/{agent_id}"
+    return f"run-{run_id(c['run'])}"
+
+
+def _live_session_run(raw: str) -> bool:
+    """True when PERPETUA_RUN names a real session, not a watcher's default.
+
+    The old gate was `int(...) == 0`: unset, empty and zero are all "not a
+    session". Canonical zero is `0000`, so this is the same refusal — but a
+    probe id (`0042.3`) has no integer form, so the parse is run_id's, which
+    refuses junk instead of raising through the gate.
+    """
+    if not raw:
+        return False
+    try:
+        return run_id(raw) != run_id(0)
+    except UnsafeRunId:
+        return False
+
+
+def _is_probe(raw: str) -> bool:
+    """Is this session a swarm probe?
+
+    Asked of goal STATE first, because state is the one input the gated process
+    does not own. The env is not a fence: `PERPETUA_ROLE` is trivially unset,
+    and — the bug D6 found — `PERPETUA_RUN` need not be *dropped* to escape, only
+    **rewritten** from `0042.3` to `0042`. That keeps every SESSION_ONLY verb
+    (the id is still a live run) while shedding every PROBE_FORBIDDEN one, at a
+    cost of nothing. An earlier version of this function argued the run id
+    "cannot be dropped the same way" and was simply wrong: dropping was never
+    the attack.
+
+    So the authoritative question is not "what does this process call itself"
+    but "is the run it claims part of a swarm the supervisor currently has in
+    flight". `state["swarm"]` is written by `run_swarm` before a probe exists
+    and cleared when the swarm ends, so while it names run N, BOTH `N.k` and
+    the bare `N` are refused — the rewrite lands on the swarm's own number,
+    which no ordinary session owns while the swarm is live.
+
+    The env checks are kept underneath as belt and braces, for the case where
+    state is unreadable and for anything that sets the role deliberately.
+
+    **This is containment, not security.** A probe's worktree lives at
+    `goals/<id>/probes/<n>-<k>`, one `cd ..` from `state.json`, and a session
+    with a shell can edit that file directly — as any ordinary session can. The
+    fence against *that* is `pp_integrity`, not this. What this guarantees is
+    narrower and worth stating exactly: a probe cannot reach a forbidden verb by
+    lying about who it is.
+    """
+    if (os.environ.get("PERPETUA_ROLE") or "").strip().lower() == "probe":
+        return True
+    try:
+        rid = run_id(raw)
+    except UnsafeRunId:
+        return False
+    if "." in rid:
+        return True
+    goal = os.environ.get("PERPETUA_GOAL_DIR")
+    if not goal:
+        return False
+    try:
+        swarm = pp_state.load(Path(goal)).get("swarm")
+    except (FileNotFoundError, ValueError, OSError):
+        return False            # unreadable state refuses nothing extra
+    if not isinstance(swarm, dict) or not swarm.get("run"):
+        return False
+    try:
+        srun = run_id(swarm["run"])
+    except UnsafeRunId:
+        return False
+    return rid == srun or rid.startswith(f"{srun}.")
+
+
+def as_list(v) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v] if v.strip() else []
+    return [str(x) for x in v if str(x).strip()]
+
+
+# ── board ────────────────────────────────────────────────────────────────
+def cmd_board_post(c, p):
+    meta = dict(p.get("meta")) if isinstance(p.get("meta"), dict) else {}
+    if p.get("claim"):
+        # A claim asserts something about the world; a report of what the author
+        # did is not one. It lands in meta (the board's one extension point) so
+        # the transport stays transport, and old lines without it read as false.
+        meta["claim"] = True
+    msg = pp_board.post(
+        c["goal"], channel=p["channel"], body=p["body"],
+        subject=p.get("subject", ""), author=author(c), run=c["run"],
+        to=p.get("to"), reply_to=p.get("reply_to"), meta=meta or None)
+    return {"posted": {k: msg[k] for k in ("seq", "channel", "thread", "ts")}}
+
+
+def cmd_board_read(c, p):
+    """Read the board. `advance_cursor` moves THIS AUTHOR's bookmark, not the
+    briefing's.
+
+    There are two cursors and they answer different questions.
+    `board_cursor[<author>]` is a persona's own reading position, moved only when
+    that persona asks for it; `board_cursor["briefing"]` is what the next session
+    is shown at wake-up, and pp_briefing owns it. They used to be conflated — the
+    briefing read a key nothing wrote — so the answer is to keep them separate and
+    say which is which.
+    """
+    msgs = pp_board.read(c["goal"], channel=p.get("channel"),
+                         since=int(p.get("since", 0)),
+                         thread=p.get("thread"), limit=int(p.get("limit", 30)))
+    top = max((m["seq"] for m in msgs), default=None)
+    cursors = (pp_state.load(c["goal"]).get("board_cursor") or {})
+    if p.get("advance_cursor") and top is not None:
+        def advance(s):
+            cur = s.setdefault("board_cursor", {})
+            cur[author(c)] = max(int(cur.get(author(c), 0) or 0), top)
+        cursors = (pp_state.patch(c["goal"], advance).get("board_cursor") or {})
+    return {"count": len(msgs), "head": pp_board.head_seq(c["goal"]),
+            "your_cursor": cursors.get(author(c), 0),
+            "briefing_cursor": cursors.get(pp_briefing.BRIEFING_CURSOR, 0),
+            "messages": msgs, "rendered": pp_board.render(msgs, goal=c["goal"])}
+
+
+def cmd_board_search(c, p):
+    """Find messages without paying to read them.
+
+    Deliberately returns hits, not bodies: the board is the one structure in a
+    perpetua goal that grows without bound, and a session that reads it linearly
+    has spent its budget before it starts. `full` exists for the rare case that
+    genuinely needs bodies; the normal drill-down is board_read with the thread.
+    """
+    hits = pp_board.search(
+        c["goal"], q=p.get("q"), regex=bool(p.get("regex")),
+        channel=p.get("channel"), author=p.get("author"), to=p.get("to"),
+        thread=p.get("thread"), subject_only=bool(p.get("subject_only")),
+        since=int(p.get("since", 0)), until=p.get("until"),
+        limit=int(p.get("limit", 40)), full=bool(p.get("full")),
+        claims_only=bool(p.get("claims_only")),
+        verified_only=bool(p.get("verified_only")))
+    return {"count": len(hits), "head": pp_board.head_seq(c["goal"]),
+            "hits": hits, "rendered": pp_board.render_hits(hits)}
+
+
+def cmd_board_verify(c, p):
+    """Append a verdict about one posted message.
+
+    Verification is a second record that references the claim's seq — the claim
+    itself is never edited, because the board is append-only. `by`/`run` come
+    from the calling session, so the ledger says who claimed a result and who
+    checked it, without either being able to rewrite the other's record.
+    """
+    rec = pp_board.verify(
+        c["goal"], seq=int(p.get("seq") or 0), verdict=p.get("verdict", ""),
+        by=author(c), run=c["run"], note=(p.get("note") or "").strip())
+    return {"verification": rec}
+
+
+def cmd_board_channels(c, _p):
+    return {"channels": pp_board.channels(c["goal"]),
+            "head": pp_board.head_seq(c["goal"]),
+            "conventions_path": str(c["goal"] / "board/CONVENTIONS.md")}
+
+
+# ── assignments ───────────────────────────────────────────────────────────
+# Structured delegation (incident plan §7): a board-backed ledger with its own
+# lock and no enforcement beyond the fold. Each event also posts to the board,
+# so delegation flows through the normal unread path — the ledger is the state,
+# the board post is the notification.
+def cmd_assign_open(c, p):
+    return pp_assign.open(c["goal"], owner=author(c), title=p.get("title"),
+                          criteria=as_list(p.get("criteria")),
+                          bounty=p.get("bounty"), to=p.get("to"),
+                          author=author(c), run=c["run"])
+
+
+def cmd_assign_claim(c, p):
+    return pp_assign.claim(c["goal"], id=p["id"], claimer=author(c),
+                           author=author(c), run=c["run"])
+
+
+def cmd_assign_resolve(c, p):
+    return pp_assign.resolve(c["goal"], id=p["id"], outcome=p["outcome"],
+                             note=p["note"], by=author(c), author=author(c),
+                             run=c["run"])
+
+
+def cmd_assign_comment(c, p):
+    return pp_assign.comment(c["goal"], id=p["id"], body=p["body"],
+                             author=author(c), run=c["run"])
+
+
+def cmd_assign_list(c, p):
+    items = list(pp_assign.index(c["goal"]).values())
+    status = p.get("status")
+    if status:
+        items = [a for a in items if a.get("status") == status]
+    items.sort(key=lambda a: a.get("updated_at") or "", reverse=True)
+    return {"count": len(items), "assignments": items,
+            "rendered": pp_assign.render_list(items)}
+
+
+# ── legacy watchers ───────────────────────────────────────────────────────
+# The one agent-authored thing that outlives the agent (incident plan §6): a
+# script the SUPERVISOR runs after the sponsoring session is dead. The bounds
+# (lifetime, fire cap, timeout) live in pp_watch as REFUSED maxima, so a session
+# cannot discover a quieter, larger limit by spelling a bound differently.
+def cmd_watch_register(c, p):
+    contract = pp_watch.register(
+        c["goal"], name=p["name"], script=p.get("script") or "",
+        trigger=p.get("trigger") or {}, subject=p.get("subject", ""),
+        channel=p.get("channel") or pp_watch.CHANNEL_DEFAULT,
+        sponsor_run=c["run"], sponsor_persona=author(c),
+        lifetime_s=p.get("lifetime_s"), max_fires=p.get("max_fires"),
+        timeout_s=p.get("timeout_s"))
+    return {"watcher": contract,
+            "note": f"armed: fires at most {contract['max_fires']} times, "
+                    f"expires {contract['expires_at']}; the supervisor runs it "
+                    f"after your session is gone."}
+
+
+def cmd_watch_list(c, p):
+    items = pp_watch.list(c["goal"])
+    return {"count": len(items), "watchers": items,
+            "rendered": pp_watch.render_list(items)}
+
+
+def cmd_watch_revoke(c, p):
+    return pp_watch.revoke(c["goal"], name=p["name"], by=author(c),
+                           reason=p.get("reason", ""))
+
+
+# ── personas ─────────────────────────────────────────────────────────────
+def cmd_persona_write(c, p):
+    name = "".join(ch for ch in p["name"] if ch.isalnum() or ch in "-_")[:48]
+    if not name:
+        raise ValueError("persona name must contain alphanumerics")
+    d = c["goal"] / "personas"
+    d.mkdir(parents=True, exist_ok=True)
+    # Rewriting a persona that has already been promoted writes the nested
+    # persona.md, not a second flat file beside its own directory — otherwise a
+    # rewrite silently orphans the identity's dossier.
+    path = pp_persona.persona_path(c["goal"], name)
+    # The one write path that derives a filename from session input — the
+    # shared refusal, so a name cannot ever resolve onto the human's fence.
+    refuse_protected(c["goal"], path)
+    existed = path.exists()
+    front = (f"---\nname: {name}\ndescription: {p.get('description', '').strip()}\n"
+             f"authored_by: {author(c)}\nauthored_at: {now_iso()}\n---\n\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(front + p["body"].strip() + "\n", encoding="utf-8")
+    return {"persona": name, "path": str(path), "overwrote": existed,
+            "has_dossier": pp_persona.has_dossier(c["goal"], name)}
+
+
+def cmd_persona_list(c, _p):
+    goal = c["goal"]
+    return {"personas": [
+        {"name": name,
+         "description": pp_persona.description(goal, name),
+         "path": str(pp_persona.persona_path(goal, name)),
+         "has_dossier": pp_persona.has_dossier(goal, name)}
+        for name in pp_persona.names(goal)]}
+
+
+def cmd_persona_dossier(c, p):
+    """Append to a persona's own dossier — the identity's append-only history."""
+    name = p.get("name") or c["persona"]
+    if not name:
+        raise ValueError("no persona to write a dossier for: name one, or run "
+                         "this session under an assigned persona")
+    if not pp_persona.exists(c["goal"], name):
+        raise FileNotFoundError(f"no persona {name!r} — write it first")
+    body = str(p.get("body") or "").strip()
+    if not body:
+        raise ValueError("a dossier entry needs a body — what happened, what it "
+                         "cost, and what it leaves open")
+    kind = "".join(ch for ch in str(p.get("kind") or "note")
+                   if ch.isalnum() or ch in "-_ ")[:32].strip() or "note"
+    path = pp_persona.append_dossier(c["goal"], name, kind=kind, body=body,
+                                     run=c["run"], by=author(c))
+    # #4: the scorecard rides along with every dossier write — a session's own
+    # queryable record, folded from the harness (run.json, handoffs, criteria
+    # met_by), never from what the dossier itself says.
+    return {"persona": name, "kind": kind, "dossier": str(path),
+            "scorecard": pp_persona.scorecard(c["goal"], name)}
+
+
+def cmd_persona_handoff(c, p):
+    """Hand an identity to a successor: dossier record + open work re-pointed."""
+    predecessor = p.get("from") or c["persona"]
+    if not predecessor:
+        raise ValueError("no persona to hand over: name `from`, or run this "
+                         "session under an assigned persona")
+    out = pp_persona.succeed(c["goal"], predecessor=predecessor,
+                             successor=p.get("to") or "",
+                             note=p.get("note") or "", run=c["run"],
+                             by=author(c))
+    if p.get("assign_now"):
+        def assign(s):
+            s["persona"] = out["successor"]
+        pp_state.patch(c["goal"], assign)
+        out["standing_persona"] = out["successor"]
+    return out
+
+
+def cmd_persona_assign(c, p):
+    name = p.get("name")
+    if name:
+        if not pp_persona.exists(c["goal"], name):
+            raise FileNotFoundError(f"no persona {name!r} — write it first")
+    def assign(s):
+        s["persona"] = name
+    pp_state.patch(c["goal"], assign)
+    return {"persona": name,
+            "note": ("This persona now runs every session until one reassigns it "
+                     "or the no-progress rule rotates it.")}
+
+
+# ── goal state ───────────────────────────────────────────────────────────
+def _criteria_items(v) -> list:
+    """`add_criteria` items, tolerating the pre-#2 shape (plain strings)
+    alongside the new one ({'text', 'parent', 'weight'}) — a session that has
+    never heard of hierarchy still gets exactly the old behaviour."""
+    if v is None:
+        return []
+    if isinstance(v, (str, dict)):
+        v = [v]
+    out = []
+    for item in v:
+        if isinstance(item, dict):
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            entry = {"text": text}
+            if item.get("parent"):
+                entry["parent"] = str(item["parent"]).strip()
+            if item.get("weight") not in (None, ""):
+                entry["weight"] = item["weight"]
+            out.append(entry)
+        elif str(item or "").strip():
+            out.append(str(item).strip())
+    return out
+
+
+def cmd_goal_state(c, p):
+    def apply(s):
+        if p.get("phase"):
+            s["phase"] = p["phase"]
+        marks = {str(x) for x in as_list(p.get("mark_done"))}
+        unmarks = {str(x) for x in as_list(p.get("mark_undone"))}
+        for crit in s["criteria"]:
+            if crit["id"] in marks:
+                crit["done"] = True
+                crit["met_at"] = now_iso()
+                # Which run ticked it, so end-session can attach "this session
+                # ticked c3" as measured evidence rather than as a claim.
+                crit["met_run"] = c["run"]
+                crit["met_by"] = author(c)
+            if crit["id"] in unmarks:
+                crit["done"] = False
+    st = pp_state.patch(c["goal"], apply)
+    amendment = None
+    added = _criteria_items(p.get("add_criteria"))
+    if added:
+        # Adding a criterion changes the charter, so it goes through the
+        # amendment ledger — the same write, but logged in the ONE place every
+        # charter change is recorded. The ledger numbers and applies it; the
+        # session sees the same criteria appear in state. #2: an item may
+        # carry `parent` to attach it under an existing criterion instead of
+        # at the top level — still a soft change, since adding a node cannot
+        # break anything that already depended on the tree's shape.
+        rec = pp_amend.propose(
+            c["goal"], target="criteria-add", change=added,
+            rationale="session added success criteria via goal_state",
+            evidence=f"tool=goal-state; by={author(c)}; run={c['run']}",
+            author=author(c), run=c["run"])
+        amendment = rec["n"]
+        st = pp_state.load(c["goal"])
+    decompose = p.get("decompose")
+    if isinstance(decompose, dict) and str(decompose.get("id") or "").strip():
+        into = as_list(decompose.get("into"))
+        if into:
+            # #2: breaking a criterion into children is the same soft shape as
+            # add_criteria — it only ever adds nodes under one that already
+            # exists, so nothing already relying on the tree can be broken by
+            # it.
+            rec = pp_amend.propose(
+                c["goal"], target="criteria-decompose",
+                change={"id": str(decompose["id"]).strip(), "into": into},
+                rationale="session decomposed a criterion via goal_state",
+                evidence=f"tool=goal-state; by={author(c)}; run={c['run']}",
+                author=author(c), run=c["run"])
+            amendment = amendment or rec["n"]
+            st = pp_state.load(c["goal"])
+    return {"phase": st["phase"], "criteria": st["criteria"],
+            "amendment": amendment}
+
+
+# ── charter amendments (R3) ───────────────────────────────────────────────
+def cmd_amend_propose(c, p):
+    """The session's half of the amendment path: file, don't edit.
+
+    Soft targets apply immediately and are logged; hard targets land in
+    pending/ and stop the loop only after three runs without a human decision
+    (the supervisor's blocked-on-human backstop). The classification and the
+    application live in pp_amend, so the CLI's approve and this tool can never
+    disagree about what a target means.
+    """
+    rec = pp_amend.propose(
+        c["goal"], target=p["target"], change=p["change"],
+        rationale=p.get("rationale", ""), evidence=p.get("evidence", ""),
+        author=author(c), run=c["run"])
+    note = ("applied immediately and logged" if rec["class"] == "soft"
+            else f"needs a human decision — {pp_amend.pending_count(c['goal'])} "
+                 f"pending")
+    return {"amendment": rec["n"], "target": rec["target"],
+            "class": rec["class"], "status": rec["status"],
+            "applied": rec.get("applied"), "note": note,
+            "pending_count": pp_amend.pending_count(c["goal"])}
+
+
+def cmd_ask_human(c, p):
+    """Raise a question that only the human who owns this goal can settle.
+
+    Distinct from `amend_propose`, and the distinction is the whole reason this
+    exists: an amendment changes the CHARTER — the objective, the criteria,
+    check.sh, goal.json — and a question about the code, the approach, or a gate
+    that is not the fence has no charter to amend. Run 16 of the first real goal
+    reasoned exactly that, correctly, and then had nowhere to put the question:
+    it posted to a topic channel addressed to nobody, and five later sessions
+    re-derived that they were blocked while the human found out by reading raw
+    JSONL.
+
+    Three writes, in an order chosen so nothing can be lost by a crash between
+    them: the LEDGER first (the durable record, and the only thing the pause
+    backstop reads), then the BOARD copy (where traffic is seen, and where the
+    human's reply threads), then the ESCALATION (which notifies out of band). A
+    question with no board copy is still tracked and still pauses the goal; a
+    board post with no ledger entry would be exactly the invisible message this
+    replaces.
+    """
+    subject = str(p.get("subject", "")).strip()
+    body = str(p.get("body", "")).strip()
+    if not subject or not body:
+        raise ValueError("ask_human needs a 'subject' and a 'body' — the human "
+                         "sees the subject first and decides from the body, so "
+                         "state the decision and the options, not just that you "
+                         "are stuck")
+    # Raises with a session-readable message if the shape is wrong; do it here
+    # so the error comes back as `error`, not a stack trace mid-write.
+    options = pp_human.normalise_options(p.get("options"))
+    if options and not pp_human.recommended_option({"options": options}):
+        raise ValueError("mark one option \"recommended\": true — the whole "
+                         "point of the questionnaire is that the human can "
+                         "accept your call with one keystroke")
+    goal = c["goal"]
+    # Asking the same thing twice does not make it answered sooner: it puts a
+    # duplicate in front of the human, doubles the notifications, and gives the
+    # pause backstop two reasons where there is one question. An open question
+    # is already shown to every session in its briefing, so a repeat is a
+    # session that did not read it — answer it with the record it missed.
+    same = next((r for r in pp_human.open_questions(goal)
+                 if r.get("subject", "").strip().lower() == subject.lower()), None)
+    if same:
+        return {"question": same["n"], "subject": same.get("subject"),
+                "already_open": True,
+                "open_questions": len(pp_human.open_questions(goal)),
+                "note": f"Q{same['n']} asks this already (raised by run "
+                        f"{same.get('run')}) and is still waiting on the human. "
+                        f"Nothing new was recorded. It is in your briefing under "
+                        f"'Waiting on the human' — work on something else."}
+    rec = pp_human.ask(goal, subject=subject, body=body, run=c["run"],
+                       persona=c["persona"], options=options)
+    board_body = body
+    if options:
+        board_body += ("\n\nOptions (★ = the session's recommendation) — answer "
+                       f"with `perpetua answer {goal.name} {rec['n']} -o <KEY>`:\n"
+                       + pp_human.render_options(options))
+    msg = None
+    try:
+        msg = pp_board.post(
+            goal, channel=pp_human.CHANNEL, author=author(c), run=c["run"],
+            to="human", subject=f"Q{rec['n']}: {subject}", body=board_body,
+            meta={"human_question": rec["n"]})
+    except Exception as exc:                                # noqa: BLE001
+        log(f"ask-human: board copy failed (the question is still on record): "
+            f"{type(exc).__name__}: {exc}")
+    try:
+        pp_escalate.open_escalation(
+            goal, kind="human-question", level="INFO",
+            text=f"Q{rec['n']} from run {c['run']}: {subject}")
+        pp_notify.notify(
+            f"❓ perpetua '{goal.name}' needs a decision — Q{rec['n']} from run "
+            f"{c['run']}: {subject}\nRead it with: perpetua inbox\n"
+            f"Answer it with: perpetua answer {goal.name} {rec['n']} \"...\"",
+            level="INFO")
+    except Exception as exc:                                # noqa: BLE001
+        log(f"ask-human: could not notify (the question is still on record): "
+            f"{type(exc).__name__}: {exc}")
+    return {"question": rec["n"], "subject": subject,
+            "board_seq": msg.get("seq") if msg else None,
+            "options": options,
+            "open_questions": len(pp_human.open_questions(goal)),
+            "note": "Recorded and the human has been notified. Do not wait for "
+                    "an answer in this session — it cannot arrive mid-session. "
+                    "Work on something else that is not blocked, or end the "
+                    "session saying what is blocked on this."}
+
+
+def cmd_human_list(c, _p):
+    """What this goal has asked, and what has come back."""
+    items = pp_human.index(c["goal"])
+    return {"count": len(items), "questions": items,
+            "open": len(pp_human.open_questions(c["goal"]))}
+
+
+# ── evidence ─────────────────────────────────────────────────────────────
+# The harness measures what it can and attaches that to the handoff, instead of
+# asking the session to report it. The difference matters: a session has every
+# incentive to describe its work generously and no way to check itself, while
+# `git rev-list` and `check.sh` have no opinion at all.
+def _git(ws: Path, *args: str) -> str:
+    try:
+        proc = subprocess.run(["git", "-C", str(ws), *args], capture_output=True,
+                              text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def evidence(c: dict) -> dict:
+    goal, n = c["goal"], c["run"]
+    ws = goal / "workspace"
+    ev: dict = {}
+
+    head = _git(ws, "rev-parse", "HEAD")
+    if head:
+        ev["commit"] = head[:10]
+        ev["commit_subject"] = _git(ws, "log", "-1", "--format=%s")[:200]
+    start = read_json(run_dir(goal, n) / "start.json", {}) or {}
+    base = start.get("commit")
+    if base and head:
+        counted = _git(ws, "rev-list", "--count", f"{base}..{head}")
+        ev["commits_this_run"] = int(counted) if counted.isdigit() else None
+
+    status = [line for line in _git(ws, "status", "--porcelain",
+                                    "--untracked-files=all").splitlines() if line]
+    ev["dirty"] = bool(status)
+    ev["files_changed"] = len(status)
+
+    mine = [m.get("seq", 0) for m in pp_board.read(goal, since=0, limit=0)
+            if m.get("run") == n and m.get("author") == author(c)]
+    ev["board_seq_range"] = [min(mine), max(mine)] if mine else [None, None]
+
+    try:
+        crit = pp_state.load(goal).get("criteria") or []
+    except FileNotFoundError:
+        crit = []
+    ev["criteria_ticked"] = [x["id"] for x in crit
+                             if x.get("done") and x.get("met_run") == n]
+
+    # A cap, not a different timeout: this one runs while the agent waits for
+    # its tool call to return, but the goal's own allowance is what decides, and
+    # a capped timeout says so rather than reading as a failed check.
+    res = pp_check.run(goal, cap=120)
+    ev["check"] = {"ran": res.ran, "passed": bool(res.passed),
+                   "returncode": res.returncode, "tail": (res.detail or "")[-400:]}
+    return ev
+
+
+# ── session lifecycle ────────────────────────────────────────────────────
+def _handoff(c, p, reason: str, source: str = "agent") -> dict:
+    return pp_journal.write_handoff(c["goal"], c["run"], {
+        "run": c["run"], "reason": reason, "source": source,
+        "session_id": c["session_id"], "persona": c["persona"],
+        "backend": c["backend"],
+        "done": as_list(p.get("done")),
+        "learned": as_list(p.get("learned")),
+        "next_steps": as_list(p.get("next_steps")),
+        "blockers": as_list(p.get("blockers")),
+        "open_questions": as_list(p.get("open_questions")),
+        "evidence": evidence(c),
+        "exempt_progress": reason in EXEMPT_REASONS,
+    })
+
+
+# Two reasons that spend a session without moving the goal, on purpose. Both are
+# exempt from the no-progress breaker: a probe that fails has told the goal
+# something true, and a refusal that holds the line is the behaviour we want, so
+# neither may be punished by the mechanism that exists to catch a session going
+# in circles.
+EXEMPT_REASONS = {"volunteered-probe", "refused-out-of-scope"}
+
+
+def _record_refusal(c, p) -> dict:
+    """Append to refusals.jsonl so the refusal is inherited, not re-argued.
+
+    Append-only and outside KNOWLEDGE_GLOBS: a refusal is a durable fact about
+    what this goal will not do, but writing one is not progress on the goal.
+    """
+    rec = {"at": now_iso(), "run": c["run"], "persona": c["persona"],
+           "request": (p.get("refused_request") or "").strip(),
+           "reason": (p.get("refused_reason") or "").strip()
+                     or "; ".join(as_list(p.get("learned"))[:2]),
+           "board_seq": p.get("board_seq")}
+    path = c["goal"] / "refusals.jsonl"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # A standing refusal is part of who a persona is, so it lands in the dossier
+    # as well as in the goal-wide ledger (#8 is fed directly by #5). Best effort:
+    # the refusal is already durable in refusals.jsonl, and a dossier write that
+    # fails must not cost the session its end-session call.
+    if c["persona"] and pp_persona.exists(c["goal"], c["persona"]):
+        try:
+            pp_persona.append_dossier(
+                c["goal"], c["persona"], kind=pp_persona.KIND_REFUSAL,
+                body=f"Asked: {rec['request'] or '(unrecorded)'}\n\n"
+                     f"Declined: {rec['reason'] or '(no reason given)'}",
+                run=c["run"], by=author(c))
+        except Exception as exc:                            # noqa: BLE001
+            print(json.dumps({"warning": f"dossier not updated: "
+                                         f"{type(exc).__name__}: {exc}"}),
+                  file=sys.stderr)
+    return rec
+
+
+def cmd_end_session(c, p):
+    reason = p.get("reason", "handoff")
+    if reason in EXEMPT_REASONS and not as_list(p.get("learned")):
+        # Returned as an error the agent can act on rather than accepted silently:
+        # the exemption is bought with a report, and a probe that reports nothing
+        # is indistinguishable from a wasted session.
+        raise ValueError(
+            f"reason={reason!r} requires a non-empty `learned` — the exemption from "
+            f"the no-progress breaker is what you get in exchange for writing down "
+            f"what the session found out. Say what you tried and what happened, "
+            f"including negative results, and call this again.")
+    h = _handoff(c, p, reason)
+    refusal = _record_refusal(c, p) if reason == "refused-out-of-scope" else None
+    def apply(s):
+        s["next"]["session_id"] = None
+        s["next"]["resume_reason"] = None
+        if p.get("next_backend"):
+            s["next"]["backend"] = p["next_backend"]
+        if "next_persona" in p:
+            s["persona"] = p["next_persona"] or None
+        if reason == "goal-complete":
+            s["next"]["nudge"] = ("The previous session believes the goal is met. "
+                                  "Verify it against check.sh and the criteria before "
+                                  "doing any new work.")
+    pp_state.patch(c["goal"], apply)
+    write_json(run_dir(c["goal"], c["run"]) / "exit.json",
+               {"kind": "end_session", "reason": reason, "at": now_iso(),
+                "exempt_progress": reason in EXEMPT_REASONS})
+    return {"handoff_written": True, "reason": reason,
+            "exempt_progress": reason in EXEMPT_REASONS,
+            "refusal_recorded": bool(refusal),
+            "evidence": h.get("evidence", {}),
+            "journal": str(pp_journal.handoff_path(c["goal"], c["run"])),
+            "next_steps_recorded": len(h["next_steps"])}
+
+
+def cmd_switch_backend(c, p):
+    cls = p["workload_class"]
+    goal_cfg = read_json(c["goal"] / "goal.json", {}) or {}
+    allow_hosted = bool(goal_cfg.get("allow_hosted"))
+    spec = pp_backend.resolve(cls, allow_hosted=allow_hosted)   # raises if unknown/hosted
+    # The D5 tooth: a swap stops the incumbent unit, and an incumbent another
+    # goal holds live is exactly the contention this exists to refuse. The
+    # check happens BEFORE the session's turn is spent, so the refusal is an
+    # error the agent can still act on — not a supervisor that finds out at
+    # the next launch and terminates the session for nothing.
+    refuse = pp_backend.hold_refusal(spec, goal=c["goal"])
+    if refuse:
+        raise ValueError(refuse)
+    _handoff(c, p, f"switch-backend:{cls}")
+    def apply(s):
+        s["next"]["backend"] = cls
+        s["next"]["session_id"] = c["session_id"]      # RESUME, don't restart
+        s["next"]["resume_reason"] = (
+            f"Your previous turn ended so the model backend could be swapped to "
+            f"{spec['provider']}/{spec['model']} ({cls}): {p.get('reason', 'no reason given')}. "
+            f"Your context is intact — continue where you stopped.")
+        s["stats"]["backend_swaps"] = s["stats"].get("backend_swaps", 0) + 1
+    pp_state.patch(c["goal"], apply)
+    write_json(run_dir(c["goal"], c["run"]) / "exit.json",
+               {"kind": "switch_backend", "class": cls, "at": now_iso()})
+    return {"switching_to": cls, "provider": spec["provider"], "model": spec["model"],
+            "resuming_session": c["session_id"]}
+
+
+# ── holds (D5) ────────────────────────────────────────────────────────────
+# A hold is the token a session takes on ITS OWN backend so no other goal's
+# swap can stop the server out from under it (the grammar is in
+# board/CONVENTIONS.md; the machinery lives in lib/pp_holds.py over the
+# root-level holds.json). Who may run this? SESSION only — the identity an
+# execution is judged by (goal + persona) exists only inside a live run, and a
+# watcher's posthumous run.sh must not get to own a cross-goal mutex after its
+# sponsor is gone. Failure class 5 asked the question; SESSION_ONLY is the
+# answer.
+def cmd_hold(c, p):
+    action = p.get("action") or "take"
+    resource = str(p.get("resource") or c["backend"] or "").strip()
+    if action == "take":
+        if not resource:
+            raise ValueError("a hold needs a resource — you are not running "
+                             "under a backend, so name one")
+        rec = pp_holds.acquire(resource, goal=c["goal"], persona=author(c),
+                               ttl_s=p.get("ttl_s"))
+        return {"hold": rec, "resource": resource,
+                "display": f"held `{resource}` as {pp_holds.describe_hold(rec)}"}
+    if action == "release":
+        if not resource:
+            raise ValueError("release needs a resource — name one")
+        rec = pp_holds.release(resource, goal=c["goal"])
+        if rec is None:
+            return {"released": False,
+                    "display": f"no live hold by this goal on `{resource}` "
+                               f"— nothing to release"}
+        return {"released": True, "resource": resource,
+                "display": f"released `{resource}` "
+                           f"({pp_holds.describe_hold(rec)})"}
+    raise ValueError(f"hold action must be 'take' or 'release', got {action!r}")
+
+
+def cmd_wedge(c, p):
+    """Recorded by the extension's turn_end detector, acted on by the supervisor."""
+    write_json(run_dir(c["goal"], c["run"]) / "wedge.json", {
+        "at": now_iso(), "char": p.get("char"), "session_id": c["session_id"],
+        "backend": c["backend"], "sample": (p.get("sample") or "")[:400],
+    })
+    return {"wedge_recorded": True}
+
+
+# ── recall (#1) ──────────────────────────────────────────────────────────
+def cmd_recall(c, p):
+    """Search the goal's own past instead of re-deriving it.
+
+    A grep over `journal/`, not a database: see pp_recall for why no index is
+    kept. `query` is required — a call with nothing to search for is a
+    misunderstanding of the tool, not an empty search.
+    """
+    query = str(p.get("query") or "").strip()
+    if not query:
+        raise ValueError("recall needs a non-empty query")
+    hits = pp_recall.search(
+        c["goal"], query, limit=int(p.get("limit", pp_recall.LIMIT_DEFAULT)),
+        before_run=p.get("before_run"), since_run=p.get("since_run"))
+    return {"count": len(hits), "hits": hits, "rendered": pp_recall.render(hits)}
+
+
+# ── orient (#8) ──────────────────────────────────────────────────────────
+def cmd_orient(c, _p):
+    """Cheap, regenerated re-orientation — see pp_orient's module docstring.
+
+    Deliberately not in SESSION_ONLY or PROBE_FORBIDDEN: it is read-only, so
+    neither gate's reason for existing applies to it, and a probe or a
+    watcher's run.sh may legitimately want to know where things stand too.
+    """
+    return {"orient": pp_orient.compose(
+        c["goal"], run=c["run"], persona=c["persona"], backend=c["backend"],
+        deadline_epoch=os.environ.get("PERPETUA_DEADLINE_EPOCH"),
+        budget_s=os.environ.get("PERPETUA_BUDGET_S"))}
+
+
+def cmd_status(c, _p):
+    st = pp_state.load(c["goal"])
+    return {"goal_id": st["goal_id"], "run": c["run"], "phase": st["phase"],
+            "status": st["status"], "criteria": st["criteria"],
+            "board_head": pp_board.head_seq(c["goal"]),
+            "handoff_written": pp_journal.has_handoff(c["goal"], c["run"])}
+
+
+COMMANDS = {
+    "board-post": cmd_board_post, "board-read": cmd_board_read,
+    "assign-open": cmd_assign_open, "assign-claim": cmd_assign_claim,
+    "assign-resolve": cmd_assign_resolve, "assign-comment": cmd_assign_comment,
+    "assign-list": cmd_assign_list,
+    "watch-register": cmd_watch_register, "watch-list": cmd_watch_list,
+    "watch-revoke": cmd_watch_revoke,
+    "board-search": cmd_board_search, "board-verify": cmd_board_verify,
+    "board-channels": cmd_board_channels, "recall": cmd_recall,
+    "persona-write": cmd_persona_write,
+    "persona-list": cmd_persona_list, "persona-assign": cmd_persona_assign,
+    "persona-dossier": cmd_persona_dossier, "persona-handoff": cmd_persona_handoff,
+    "goal-state": cmd_goal_state, "end-session": cmd_end_session,
+    "switch-backend": cmd_switch_backend, "wedge": cmd_wedge, "status": cmd_status,
+    "hold": cmd_hold,
+    "amend-propose": cmd_amend_propose,
+    "orient": cmd_orient,
+    "ask-human": cmd_ask_human, "human-list": cmd_human_list,
+}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] not in COMMANDS:
+        print(json.dumps({"error": f"usage: pp-tool <{'|'.join(COMMANDS)}> '<json>'"}))
+        return 1
+    if argv[1] in PROBE_FORBIDDEN and _is_probe(os.environ.get("PERPETUA_RUN", "")):
+        print(json.dumps({"error": f"{argv[1]} {PROBE_MSG}."}))
+        return 1
+    if argv[1] in SESSION_ONLY and not _live_session_run(
+            os.environ.get("PERPETUA_RUN", "")):
+        print(json.dumps({"error": f"{argv[1]} {WS_MSG} — a watcher must not "
+                                   f"write a handoff or touch the criteria"}))
+        return 1
+    # stdout is a CONTRACT — exactly one JSON object — and the libraries this
+    # shells into share `pp_common.log`, which writes to stdout because the
+    # supervisor's log is stdout. One best-effort log line from a ledger or a
+    # promotion would otherwise make the tool's output unparseable for the
+    # extension. Capture it and forward it to stderr, where a session's log
+    # still keeps it.
+    noise = io.StringIO()
+    try:
+        payload = json.loads(argv[2]) if len(argv) > 2 and argv[2] else {}
+        with contextlib.redirect_stdout(noise):
+            out = COMMANDS[argv[1]](ctx(), payload)
+        _flush(noise)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    except Exception as exc:                            # noqa: BLE001
+        _flush(noise)
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+        return 1
+
+
+def _flush(buf: "io.StringIO") -> None:
+    text = buf.getvalue()
+    if text:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

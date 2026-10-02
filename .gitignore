@@ -1,0 +1,31 @@
+# Perpetua runtime data must stay outside the source export.
+goals/
+config/
+backup/
+backups/
+transcripts/
+logs/
+screenshots/
+*.bak
+*.backup
+holds.json
+holds.lock
+inference.lock
+pi-sessions/
+sessions/
+*.jsonl
+*.log
+*.pid
+*.lock
+.interview-spec.json
+
+# Python environments and generated files.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

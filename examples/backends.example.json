@@ -1,0 +1,14 @@
+{
+  "default_class": "local-example",
+  "classes": {
+    "local-example": {
+      "provider": "openai-compatible",
+      "model": "REPLACE_WITH_YOUR_MODEL_ID",
+      "enabled": false,
+      "context_tokens": 8192,
+      "slots": 1
+    }
+  },
+  "hosted_classes": {},
+  "escalation": {}
+}

@@ -1,0 +1,1247 @@
+#!/usr/bin/env python3
+"""perpetua — CLI for persistent, multi-session pi goals.
+
+  perpetua new <id> --title T --objective O   scaffold a goal
+  perpetua start <id> [--once] [--max-runs N] run the supervisor in the foreground
+  perpetua run <id>                           alias for `start --once`
+  perpetua enable <id> / disable <id>         run it as a systemd user unit
+  perpetua status [<id>]                      where every goal stands
+  perpetua journal <id> [-n N]                the handoff chain
+  perpetua board <id> [--channel C] [--since S]
+  perpetua personas <id>
+  perpetua runs <id> [-n N]                   per-session outcomes
+  perpetua tail <id>                          follow the current session's log
+  perpetua check <id>                         run the completion predicate now
+  perpetua resume <id>                        clear a pause and continue
+  perpetua ack <id>                           acknowledge a pause without resuming
+  perpetua escalate-check [<id>]              staleness-bump check (systemd-timer fallback)
+  perpetua amend <id> [--list|--approve N|--reject N --reason ...]
+                                              the human side of charter amendments
+  perpetua watchers <id> [--revoke NAME]      what is still armed on the goal
+  perpetua holds                           live cross-goal backend holds
+  perpetua backends                           list workload classes and their health
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import pp_backend                                          # noqa: E402
+import pp_check                                            # noqa: E402
+import pp_interview                                        # noqa: E402
+import pp_board                                            # noqa: E402
+import pp_journal                                          # noqa: E402
+import pp_state                                            # noqa: E402
+import pp_amend
+import pp_attribute
+import pp_criteria
+import pp_escalate
+import pp_human
+import pp_integrity
+import pp_notify
+import pp_watch
+import pp_persona
+import pp_holds
+import pp_probe
+import pp_swarm
+import pp_control
+import pp_routing
+
+#: What a human reading at a terminal gets by default, and with `--full`.
+#: `pp_board.render`'s own 1200 default is a BRIEFING budget rule — one long
+#: message must not eat a session's context — and it has no business governing
+#: a view whose only purpose is a person reading what was said. 8000 covers
+#: every message this codebase has ever produced; `--full` removes the cap.
+CLI_MAX_BODY = 8_000
+HUMAN_MAX_BODY = 10 ** 9
+
+from pp_common import (BIN, GOALS, ROOT, TEMPLATES, UnsafeGoalId,  # noqa: E402
+                       goal_dir, now_iso, read_json, run_dir,
+                       run_no, safe_goal_id, supervisor_pid, write_json)
+
+WIKI_INIT = Path(os.environ["PERPETUA_WIKI_INIT"]) if os.environ.get(
+    "PERPETUA_WIKI_INIT") else None
+
+
+def need(goal_id: str) -> Path:
+    """Resolve a goal id, or exit. Every command that takes an id goes through here."""
+    g = goal_dir(goal_id)
+    if not (g / "state.json").exists():
+        sys.exit(f"no such goal: {g}")
+    return g
+
+
+def gid_of(goal_id: str) -> str:
+    """The validated slug, for commands that need the name rather than the path."""
+    return safe_goal_id(goal_id)
+
+
+def default_stall(session_timeout_s) -> int:
+    """A stall budget that can actually fire, derived from the session budget.
+
+    A third of the session, floored at five minutes and capped at the CLI's own
+    default. The floor matters because the signals are coarse: a run is stalled
+    only when the pane log, the session transcript AND the backend all say
+    nothing is happening, and on a slow local model one honest turn can be very
+    long.
+    """
+    try:
+        budget = int(session_timeout_s or 1500)
+    except (TypeError, ValueError):
+        budget = 1500
+    return max(300, min(2400, budget // 3))
+
+
+# ── new ───────────────────────────────────────────────────────────────────
+def cmd_new(args) -> int:
+    # No goal id means "I do not want to remember fifteen flags" — interview instead.
+    spec_file = getattr(args, "from_spec", None)
+    if not args.goal_id or spec_file:
+        # --from-spec skips the interview and takes its output directly: how the
+        # scaffolding half gets tested without a human, and how a goal gets created
+        # from a script.
+        spec = (read_json(Path(spec_file)) if spec_file
+                else pp_interview.run(ROOT / ".interview-spec.json"))
+        if spec is None:
+            print(f"could not read a goal spec from {spec_file or 'the interview'}")
+            return 1
+        fatal = [m for sev, m in pp_interview.validate(spec) if sev == "fatal"]
+        for sev, problem in pp_interview.validate(spec):
+            print(("❌ " if sev == "fatal" else "⚠️  ") + problem)
+        if fatal:
+            # These are the problems that make a goal unsafe or unfinishable. A
+            # goal whose check.sh can never pass runs until someone notices, which
+            # on an unattended loop can be days; refusing to create it costs one
+            # re-run of the interview.
+            print("\nrefusing to create a goal that cannot work — fix the spec and retry")
+            return 1
+        args = argparse.Namespace(
+            goal_id=spec["goal_id"], title=spec.get("title"),
+            objective=spec.get("objective"), rationale=spec.get("rationale"),
+            criterion=list(spec.get("criteria") or []),
+            constraint=spec.get("constraints"), check=None,
+            check_text=spec.get("check_sh"),
+            boundaries=spec.get("boundaries"),
+            backend=spec.get("default_backend"),
+            allow_hosted=bool(spec.get("allow_hosted")),
+            consolidate_every=10, max_runs=None,
+            session_timeout=int(spec.get("session_timeout_s") or 1500),
+            # NOT session_timeout_s again. Reading the same key for both made
+            # every spec-created goal — which is every goal the interview
+            # produces — carry stall == hard, so the stall watchdog could never
+            # fire before the session timeout it was meant to pre-empt.
+            stall_timeout=int(spec.get("stall_timeout_s")
+                              or default_stall(spec.get("session_timeout_s"))),
+            check_timeout=int(spec.get("check_timeout_s") or
+                              pp_check.DEFAULT_TIMEOUT_S),
+            no_notify=False)
+        args.notify = False
+
+    try:
+        gid = safe_goal_id(args.goal_id)
+    except UnsafeGoalId as exc:
+        sys.exit(f"bad goal id: {exc}")
+    g = GOALS / gid
+    if (g / "state.json").exists():
+        sys.exit(f"goal {gid} already exists at {g}")
+    for sub in ("journal", "runs", "personas", "board/channels", "workspace"):
+        (g / sub).mkdir(parents=True, exist_ok=True)
+
+    criteria = [c.strip() for c in (args.criterion or []) if c.strip()]
+    charter = (TEMPLATES / "GOAL.md").read_text(encoding="utf-8")
+    charter = (charter
+               .replace("{TITLE}", args.title or gid)
+               .replace("{OBJECTIVE}", args.objective or "_(not stated)_")
+               .replace("{RATIONALE}", args.rationale or
+                        "_(not stated — a session should work this out and rewrite this section)_")
+               .replace("{CRITERIA}", "\n".join(f"- {c}" for c in criteria)
+                        or "- _(none recorded yet)_")
+               .replace("{CONSTRAINTS}", args.constraint or "None beyond the above."))
+    (g / "GOAL.md").write_text(charter, encoding="utf-8")
+
+    check = g / "check.sh"
+    check_text = getattr(args, "check_text", None)
+    if check_text:
+        body = check_text if check_text.startswith("#!") else "#!/usr/bin/env bash\n" + check_text
+        check.write_text(body.rstrip() + "\n", encoding="utf-8")
+    elif args.check and Path(args.check).exists():
+        shutil.copy(args.check, check)
+    else:
+        shutil.copy(TEMPLATES / "check.sh", check)
+    check.chmod(0o755)
+
+    # BOUNDARIES.md — the human's fence (R1). Seeded from the interview's answer
+    # when the spec carried the human's own words, else the template that says
+    # what the file is for and whose file it is. Either way it is the human's
+    # file from here on: the harness only ever restores it, never edits it.
+    boundaries = (getattr(args, "boundaries", None) or "").strip()
+    if boundaries:
+        (g / "BOUNDARIES.md").write_text(boundaries + "\n", encoding="utf-8")
+    else:
+        tmpl = (TEMPLATES / "BOUNDARIES.md").read_text(encoding="utf-8")
+        (g / "BOUNDARIES.md").write_text(
+            tmpl.replace("{TITLE}", args.title or gid), encoding="utf-8")
+
+    write_json(g / "goal.json", {
+        "goal_id": gid, "created_at": now_iso(),
+        "allow_hosted": bool(args.allow_hosted),
+        "default_backend": args.backend,
+        "consolidate_every": args.consolidate_every,
+        "max_runs": args.max_runs,
+        "session_timeout_s": args.session_timeout,
+        "stall_timeout_s": args.stall_timeout,
+        "check_timeout_s": args.check_timeout,
+        "no_progress_limit": 3,
+        "notify": bool(args.notify and not args.no_notify),
+    })
+
+    state = pp_state.default_state(gid)
+    state["criteria"] = [{"id": f"c{i+1}", "text": t, "done": False,
+                          "added_by": "human", "added_at": now_iso()}
+                         for i, t in enumerate(criteria)]
+    # Hash BOUNDARIES.md and check.sh into state and back them up before state
+    # is first written: the supervisor refuses to run a goal whose fence or
+    # predicate drifted, and this is what it compares against. record() stamps
+    # both files, so a goal gets a FULL integrity record or none.
+    pp_integrity.record(g, state)
+    write_json(g / "state.json", state)
+    pp_board.ensure(g)
+
+    ws = g / "workspace"
+    if not (ws / ".git").exists():
+        subprocess.run(["git", "init", "-q", str(ws)], check=False)
+        # #7: installed before the first commit, so even "perpetua: empty
+        # workspace" carries its trailers — a goal's attribution trail starts
+        # at commit zero, not at whenever a session first touches the repo.
+        pp_attribute.install(ws)
+        (ws / ".gitkeep").touch()
+        subprocess.run(["git", "-C", str(ws), "add", "-A"], check=False)
+        subprocess.run(["git", "-C", str(ws), "commit", "-qm",
+                        "perpetua: empty workspace"], check=False,
+                       env={**os.environ, "PERPETUA_GOAL_DIR": str(g),
+                            "GIT_AUTHOR_NAME": "perpetua",
+                            "GIT_AUTHOR_EMAIL": "perpetua@localhost",
+                            "GIT_COMMITTER_NAME": "perpetua",
+                            "GIT_COMMITTER_EMAIL": "perpetua@localhost"})
+
+    if WIKI_INIT is not None and WIKI_INIT.exists():
+        subprocess.run([sys.executable, str(WIKI_INIT), str(g),
+                        "--title", args.title or gid,
+                        "--description", (args.objective or gid)[:200],
+                        "--actor", "process:perpetua"],
+                       capture_output=True, check=False)
+
+    print(f"created goal '{gid}' at {g}")
+    print(f"  charter    : {g / 'GOAL.md'}")
+    print(f"  boundaries : {g / 'BOUNDARIES.md'}  ← the human's fence; only you edit it")
+    print(f"  check      : {g / 'check.sh'}  ← the real predicate (changed via amendments)")
+    print(f"  start      : perpetua start {gid}")
+    return 0
+
+
+# ── running ───────────────────────────────────────────────────────────────
+def cmd_start(args) -> int:
+    need(args.goal_id)
+    cmd = [str(BIN / "perpetuad"), gid_of(args.goal_id)]
+    if getattr(args, "once", False):
+        cmd.append("--once")
+    if getattr(args, "max_runs", None) is not None:
+        cmd += ["--max-runs", str(args.max_runs)]
+    return subprocess.call(cmd)
+
+
+def cmd_enable(args) -> int:
+    need(args.goal_id)
+    unit = unit_name(gid_of(args.goal_id))
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    rc = subprocess.call(["systemctl", "--user", "enable", "--now", unit])
+    print(f"{unit}: {'started' if rc == 0 else 'failed to start'}")
+    print(f"logs: journalctl --user -u {unit} -f")
+    return rc
+
+
+def cmd_disable(args) -> int:
+    need(args.goal_id)
+    return subprocess.call(["systemctl", "--user", "disable", "--now",
+                            unit_name(gid_of(args.goal_id))])
+
+
+def unit_name(gid: str) -> str:
+    return f"perpetua@{gid}.service"
+
+
+def _unit_state(unit: str, prop: str) -> str:
+    proc = subprocess.run(["systemctl", "--user", "show", "-p", prop, "--value", unit],
+                          capture_output=True, text=True)
+    return (proc.stdout or "").strip()
+
+
+def cmd_resume(args) -> int:
+    """Clear a pause AND get the goal moving again.
+
+    Clearing the flag used to be all this did, which made `perpetua resume` a lie:
+    the supervisor that paused had already exited, so the goal sat idle until
+    somebody separately noticed and ran `perpetua start`. A pause is only really
+    lifted when something is running again.
+    """
+    g = need(args.goal_id)
+    gid = gid_of(args.goal_id)
+    st = pp_state.load(g)
+    if supervisor_pid(g) is not None:
+        print(f"{gid}: already supervised; pause it before resuming")
+        return 1
+    reason = pp_control.budget_reason(g, read_json(g / "goal.json", {}) or {}, st)
+    if reason:
+        print(f"{reason}. Approve a goal.json budget amendment before resuming.")
+        return 1
+    was = (st.get("breaker") or {}).get("paused_reason")
+
+    def unpause(s):
+        s.pop("pause_requested_at", None)
+        s["status"] = pp_state.STATUS_IDLE
+        s["breaker"] = {"consecutive_failures": 0, "consecutive_no_progress": 0,
+                        "consecutive_wedges": 0, "paused_reason": None}
+    pp_state.patch(g, unpause)
+    print(f"{g.name}: cleared pause"
+          + (f" ({was})" if was else " (it was not paused)")
+          + " and reset the breaker counters")
+    # #3: resuming IS the acknowledgement — a human looking at the goal and
+    # deciding to continue it is exactly what an escalation was raised to
+    # get. Best effort: a goal with no escalations.jsonl (nothing was ever
+    # escalated) acknowledges nothing, which is correct, not an error.
+    try:
+        acked = pp_escalate.acknowledge(g)
+        if acked:
+            print(f"  acknowledged escalation e{acked['n']} (was {acked['level']})")
+    except Exception as exc:                            # noqa: BLE001
+        print(f"  (escalation not acknowledged: {type(exc).__name__}: {exc})")
+
+    if getattr(args, "no_start", False):
+        print(f"not restarting anything (--no-start). Run it with: perpetua start {gid}")
+        return 0
+
+    unit = unit_name(gid)
+    enabled = _unit_state(unit, "UnitFileState")
+    if enabled in ("enabled", "enabled-runtime", "static"):
+        # The unit exists and is wanted at boot, so the goal is meant to run under
+        # systemd; restart is what "continue" means for it. `start` would be a
+        # no-op on a unit systemd still considers active after a paused exit.
+        rc = subprocess.call(["systemctl", "--user", "restart", unit])
+        print(f"{unit}: {'restarted' if rc == 0 else 'FAILED to restart'}")
+        print(f"logs: journalctl --user -u {unit} -f")
+        if rc != 0:
+            # Do not claim the goal is resumed when no supervisor was started.
+            # Restore a durable pause so status and a later retry remain honest.
+            def restore_pause(s):
+                s["status"] = pp_state.STATUS_PAUSED
+                s["breaker"]["paused_reason"] = (
+                    was or f"resume failed: systemd could not restart {unit}")
+            pp_state.patch(g, restore_pause)
+        return rc
+
+    if getattr(args, "background", False):
+        try:
+            pid = pp_control.start_background(g)
+        except OSError as exc:
+            def restore(s):
+                s["status"] = pp_state.STATUS_PAUSED
+                s["breaker"]["paused_reason"] = f"resume failed: {exc}"
+            pp_state.patch(g, restore)
+            print(f"Could not launch supervisor: {exc}", file=sys.stderr)
+            return 1
+        print(f"Supervisor launch requested (pid {pid}); inspect status and {g / 'supervisor.log'} for readiness.")
+        return 0
+
+    print(f"{gid} is not enabled as a systemd unit. Continue it with either:")
+    print(f"  perpetua start {gid}      (foreground)")
+    print(f"  perpetua enable {gid}     (background, restarts across reboots)")
+    return 0
+
+
+def cmd_ack(args) -> int:
+    """#3: "I have seen it, stop escalating, I am not ready to resume yet."
+
+    Distinct from `perpetua resume`: resuming both acknowledges AND restarts
+    the goal, and sometimes a human wants only the first — they have seen the
+    3am page and will deal with it in the morning, but the goal should stay
+    paused and quiet in the meantime rather than bumping to URGENT at dawn.
+    """
+    g = need(args.goal_id)
+    rec = pp_escalate.acknowledge(g)
+    if rec is None:
+        print(f"{args.goal_id}: no unacknowledged escalation")
+        return 0
+    print(f"{args.goal_id}: acknowledged escalation e{rec['n']} (was {rec['level']}) "
+          f"— it will not bump further. The goal is still paused; resume it "
+          f"with: perpetua resume {args.goal_id}")
+    return 0
+
+
+def cmd_escalate_check(args) -> int:
+    """The fallback path (#3): the same staleness check `perpetuad` runs at
+    its own startup, run here with no supervisor lock at all — for a
+    systemd timer, if a paused goal's supervisor turns out not to restart
+    often enough in practice for the startup path alone to matter."""
+    ids = [gid_of(args.goal_id)] if args.goal_id else sorted(
+        p.name for p in GOALS.glob("*") if (p / "state.json").exists())
+    acted = 0
+    for gid in ids:
+        g = GOALS / gid
+        st = read_json(g / "state.json", {}) or {}
+        if not pp_state.is_paused(st):
+            continue
+        cfg = read_json(g / "goal.json", {}) or {}
+        bumped = pp_escalate.check_and_bump(
+            g, stale_s=float(cfg.get("escalation_stale_s")
+                             or pp_escalate.DEFAULT_STALE_S),
+            notify_enabled=bool(cfg.get("notify", False)))
+        if bumped:
+            acted += 1
+            print(f"{gid}: escalation bumped to {bumped['level']} "
+                  f"({bumped['bumps']} bump(s) so far)")
+    if not acted:
+        print("nothing to escalate")
+    return 0
+
+
+# ── reading ───────────────────────────────────────────────────────────────
+def _status_line(g: Path) -> str:
+    st = read_json(g / "state.json", {}) or {}
+    # "running" with no live supervisor means a session was in flight when the
+    # supervisor stopped — reporting that as running is a lie the dashboard and
+    # the CLI should tell identically.
+    status = st.get("status", "?")
+    if status == "running" and supervisor_pid(g) is None:
+        status = "interrupted"
+    stats = st.get("stats", {})
+    crit = st.get("criteria", [])
+    # #2: leaf-counted, or a decomposed criterion inflates the denominator —
+    # 1 criterion split into 3 children reads as 4 items instead of 3.
+    met, total = pp_criteria.leaf_totals(crit)
+    breaker = st.get("breaker", {})
+    flags = []
+    if breaker.get("paused_reason"):
+        flags.append(f"PAUSED: {breaker['paused_reason'][:60]}")
+    if breaker.get("consecutive_no_progress"):
+        flags.append(f"{breaker['consecutive_no_progress']} runs w/o progress")
+    pending = pp_amend.pending_count(g)
+    if pending:
+        flags.append(f"{pending} amendment(s) pending")
+    return (f"{g.name:<24} {status:<13} run {st.get('run', 0):<5} "
+            f"criteria {met}/{total:<4} clean {stats.get('sessions_ended_cleanly', 0)} "
+            f"reaped {stats.get('reaped', 0)} wedges {stats.get('wedges_healed', 0)} "
+            f"swaps {stats.get('backend_swaps', 0)}"
+            + ("  [" + "; ".join(flags) + "]" if flags else ""))
+
+
+def cmd_status(args) -> int:
+    if args.goal_id:
+        g = need(args.goal_id)
+        st = pp_state.load(g)
+        print(json.dumps(st, indent=2))
+        print("\n" + pp_state.criteria_summary(st))
+        res = _check(g)
+        print(f"\ncheck.sh: {'PASS' if res.passed else 'not met'} — {res.detail[:300]}")
+        pend = [r for r in pp_amend.list_records(g) if r.get("pending")]
+        if pend:
+            print("\npending amendments (human action required — the goal pauses "
+                  "after 3 runs of these):")
+            for rec in pend:
+                who = rec.get("author") or "?"
+                print(f"  A{rec['n']:04d} [{rec['target']}/{rec['class']}] filed by "
+                      f"{who}: {str(rec.get('rationale') or rec.get('change'))[:110]}")
+            print(f"  → decide with: perpetua amend {g.name} --approve A / "
+                  f"--reject A --reason '...'")
+        else:
+            print("\nno pending amendments")
+        return 0
+    goals = sorted(p for p in GOALS.glob("*") if (p / "state.json").exists())
+    if not goals:
+        print("no goals yet — perpetua new <id> --title ... --objective ...")
+        return 0
+    for g in goals:
+        print(_status_line(g))
+    return 0
+
+
+def cmd_amend(args) -> int:
+    """The human side of the charter-amendment ledger (R3).
+
+    No flag means the same as --list. Approval applies the amendment — for a
+    check.sh change that also re-anchors the supervisor's integrity hash, which
+    is the one way the completion predicate legitimately moves. Rejection keeps
+    the proposal in the ledger, marked, so a later session does not re-litigate
+    a re-scope the human already refused.
+    """
+    g = need(args.goal_id)
+    if args.approve is not None:
+        rec = pp_amend.approve(g, args.approve)
+        print(f"A{rec['n']:04d} [{rec['target']}] approved and applied: "
+              + ", ".join(rec.get("applied", [])))
+        return 0
+    if args.reject is not None:
+        if not (args.reason or "").strip():
+            sys.exit("--reject needs --reason: why the amendment is refused")
+        pp_amend.reject(g, args.reject, args.reason)
+        print(f"A{args.reject:04d} rejected: {args.reason}")
+        return 0
+    records = pp_amend.list_records(g)
+    if not records:
+        print("no amendments filed yet")
+        return 0
+    for rec in records:
+        status = rec.get("status", "?")
+        mark = {"pending": "⏳", "approved": "✓", "rejected": "✗"}.get(status, "·")
+        print(f"{mark} A{rec['n']:04d} [{rec['target']}/{rec['class']}] {status} — "
+              f"{rec.get('author')} @ {rec.get('at')}")
+        if rec.get("rationale"):
+            print(f"      rationale: {str(rec['rationale'])[:140]}")
+        change = rec.get("change")
+        if not isinstance(change, str):
+            change = json.dumps(change)
+        print(f"      change: {str(change)[:140]}")
+        if status == "rejected" and rec.get("reject_reason"):
+            print(f"      rejected because: {str(rec['reject_reason'])[:140]}")
+    return 0
+
+
+def cmd_watchers(args) -> int:
+    """The human side of the legacy-watcher surface: what is still armed on a
+    goal you thought was finished. A watcher is agent-authored code the
+    supervisor runs after the agent is gone, so a finished goal with watchers
+    left on it is the one thing that still has a pulse — see them here, and
+    revoke with --revoke."""
+    g = need(args.goal_id)
+    if args.revoke:
+        rec = pp_watch.revoke(g, name=args.revoke, by="human",
+                              reason=args.reason or "")
+        print(f"revoked {rec['name']} by {rec['revoked_by']}: "
+              f"{rec['revoke_reason']}")
+    print(pp_watch.render_list(pp_watch.list(g)))
+    return 0
+
+
+def cmd_swarm(args) -> int:
+    """Ask for the next run to be a swarm: K probes on one problem, in parallel.
+
+    A request, not a launch — it sets a flag the supervisor reads at the top of
+    its next run, so it works whether the goal is running right now or asleep.
+    Show what the last swarm produced with no --request.
+    """
+    g = need(args.goal_id)
+    st = pp_state.load(g)
+    if args.request:
+        def ask(s):
+            s.setdefault("next", {})["swarm"] = True
+        pp_state.patch(g, ask)
+        k = load_goal_cfg_k(g)
+        print(f"the next run of '{args.goal_id}' will be a swarm of up to {k} "
+              f"probe(s) (clamped at launch to what the backend can serve)")
+        return 0
+    if args.cancel:
+        def unask(s):
+            s.setdefault("next", {})["swarm"] = False
+        pp_state.patch(g, unask)
+        print(f"swarm request on '{args.goal_id}' cancelled")
+        return 0
+
+    pending = bool((st.get("next") or {}).get("swarm"))
+    live = st.get("swarm") if isinstance(st.get("swarm"), dict) else None
+    last = st.get("swarm_last") if isinstance(st.get("swarm_last"), dict) else None
+    print(f"swarm requested for the next run: {'yes' if pending else 'no'}")
+    if live:
+        print(f"running now: run {live.get('run')} with {live.get('k')} probe(s), "
+              f"started {live.get('started_at')}")
+    if last:
+        s = last.get("summary") or {}
+        print(f"last swarm: run {last.get('run')} — {s.get('productive', '?')}/"
+              f"{s.get('probes', '?')} probe(s) left {s.get('commits', '?')} "
+              f"commit(s) at {last.get('at')}")
+        for probe in pp_probe.list_probes(g, last.get("run")):
+            print(f"  probe {probe['k']}: {probe.get('branch')} "
+                  f"(on disk: {probe.get('on_disk')})")
+    elif not live:
+        print("no swarm has run on this goal yet")
+    return 0
+
+
+def load_goal_cfg_k(goal) -> int:
+    """The configured swarm_k for display. The real clamp happens at launch."""
+    cfg = read_json(goal / "goal.json", {}) or {}
+    try:
+        return int(cfg.get("swarm_k", pp_swarm.DEFAULT_K))
+    except (TypeError, ValueError):
+        return pp_swarm.DEFAULT_K
+
+
+def cmd_holds(_args) -> int:
+    """The human side of the hold surface: what is claimed on the shared box.
+    Holds are cross-goal — one file at the perpetua root, no goal dir — so
+    unlike watchers this takes no goal id. It answers "who owns the model
+    server right now, and until when"."""
+    print(pp_holds.render_list(pp_holds.all_holds()))
+    return 0
+
+
+def cmd_journal(args) -> int:
+    g = need(args.goal_id)
+    entries = pp_journal.recent(g, args.number)
+    print("\n\n".join(entries) if entries else "_no journal entries yet_")
+    return 0
+
+
+def cmd_board(args) -> int:
+    g = need(args.goal_id)
+    chans = pp_board.channels(g)
+    if getattr(args, "search", None):
+        hits = pp_board.search(g, q=args.search, regex=args.regex,
+                               channel=args.channel, author=args.author,
+                               since=args.since, limit=args.number)
+        print(f"{len(hits)} hit(s), head #{pp_board.head_seq(g)}\n")
+        print(pp_board.render_hits(hits))
+        return 0
+    msgs = pp_board.read(g, channel=args.channel, since=args.since, limit=args.number)
+    print("channels: " + (", ".join(f"{k} ({v.get('count', 0)})"
+                                    for k, v in sorted(chans.items())) or "none"))
+    print(f"head: #{pp_board.head_seq(g)}\n")
+    # A terminal is not a context window. `render`'s 1200-char cap exists to
+    # stop one long message eating a briefing's budget, and it leaked into the
+    # one view whose whole job is letting a human read what was actually said —
+    # so an operator looking for the message a session had raised for them found
+    # "… [truncated, 2330 chars total]" and no way to see the rest.
+    print(pp_board.render(msgs, goal=g, max_body=HUMAN_MAX_BODY if args.full
+                          else CLI_MAX_BODY))
+    return 0
+
+
+def cmd_inbox(args) -> int:
+    """Everything across every goal that is waiting on a human.
+
+    The view that did not exist. A session with a decision only a human could
+    make had no address to send it to and no list it would appear on: it posted
+    to a topic channel, and the operator's only way to find it was reading every
+    message on every channel of every goal.
+    """
+    goals = [need(args.goal_id)] if args.goal_id else sorted(
+        p for p in GOALS.iterdir() if (p / "state.json").exists())
+    waiting = 0
+    for g in goals:
+        extra = [item for item in pp_control.inbox(g) if item["kind"] in {"alert", "paused"}]
+        for item in extra:
+            print(f"── {g.name} · {item['id']} · {item['subject']} ──")
+            print(item["body"])
+            print(item["action"])
+        waiting += len(extra)
+        questions = pp_human.open_questions(g)
+        pending = [r for r in pp_amend.list_records(g) if r.get("pending")]
+        if not questions and not pending:
+            continue
+        waiting += len(questions) + len(pending)
+        print(f"── {g.name} ──")
+        for q in questions:
+            print(f"  Q{q['n']} · asked by run {q.get('run')} · {q.get('at')}"
+                  f"{_age(q.get('at'))}")
+            print(f"     {q.get('subject', '')}")
+            body = (q.get("body") or "").strip()
+            if args.full:
+                print("\n" + textwrap.indent(body, "     ") + "\n")
+            else:
+                first = body.splitlines()[0] if body else ""
+                print(f"     {first[:160]}")
+            opts = q.get("options") or []
+            if opts:
+                print(textwrap.indent(pp_human.render_options(opts), "     "))
+                reco = pp_human.recommended_option(q)
+                print(f"     answer: perpetua answer {g.name} {q['n']} -o "
+                      f"{reco['key'] if reco else '<KEY>'}   "
+                      f"(or: perpetua questionnaire {g.name})")
+            else:
+                print(f"     answer: perpetua answer {g.name} {q['n']} \"...\"")
+        for a in pending:
+            print(f"  amendment {a.get('n')} · {a.get('target')} · "
+                  f"{a.get('at')}{_age(a.get('at'))}")
+            print(f"     {str(a.get('rationale', ''))[:160]}")
+            print(f"     approve: perpetua amend {g.name} --approve {a.get('n')}")
+        print()
+    if not waiting:
+        print("nothing is waiting on you")
+    return 0
+
+
+def _record_answer(g, target, *, text=None, option=None) -> dict | None:
+    """Shared write path for `perpetua answer` and `perpetua questionnaire`:
+    the board copy, the ledger entry, and the escalation acknowledgement, in the
+    order pp-tool's ask side chose so a crash between any two loses nothing.
+    Raises ValueError (from pp_human.answer) on a bad option key."""
+    n = target["n"]
+    # Resolve the option now so the board copy shows the real choice, not a key.
+    body = text or ""
+    if option is not None:
+        picked = pp_human.find_option(target, option)
+        if picked is None:
+            keys = ", ".join(o["key"] for o in target.get("options") or [])
+            raise ValueError(f"Q{n} has no option {option!r}"
+                             + (f" — choices are {keys}" if keys else ""))
+        body = pp_human.compose_answer(picked, text or "")
+    msg = None
+    try:
+        msg = pp_board.post(g, channel=pp_human.CHANNEL, author="human",
+                            to="anyone", subject=f"Answer to Q{n}: "
+                                                 f"{target.get('subject', '')}",
+                            body=body, meta={"human_answer": n})
+    except Exception as exc:                                # noqa: BLE001
+        print(f"(board copy failed, the answer is still on record: {exc})",
+              file=sys.stderr)
+    out = pp_human.answer(g, n, text=text, option=option,
+                          board_seq=msg.get("seq") if msg else None)
+    # Answering is the acknowledgement: the escalation this question opened has
+    # done its job and must stop climbing the ladder.
+    try:
+        pp_escalate.acknowledge(g)
+    except Exception:                                       # noqa: BLE001
+        pass
+    return out
+
+
+def cmd_answer(args) -> int:
+    g = need(args.goal_id)
+    text = (args.text or "").strip() or None
+    option = (args.option or "").strip().upper() or None
+    if not text and not option:
+        print("nothing to record — give the answer as text, or -o <KEY> to pick "
+              "one of the options the session offered", file=sys.stderr)
+        return 1
+    target = next((r for r in pp_human.index(g) if r["n"] == args.n), None)
+    if target is None:
+        print(f"no question {args.n} on goal {g.name} — `perpetua inbox {g.name}`",
+              file=sys.stderr)
+        return 1
+    try:
+        out = _record_answer(g, target, text=text, option=option)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(f"answered Q{args.n} on {g.name}. The next session gets it as "
+          f"priority-1 briefing content — it cannot be dropped for space, and "
+          f"it stays there until a session has actually been handed it.")
+    if out and out.get("withdrawn_at"):
+        print("note: this question had already been withdrawn by a session.")
+    return 0
+
+
+def cmd_questionnaire(args) -> int:
+    """Walk every open question and settle it by picking an option.
+
+    The interactive companion to `perpetua answer`: for a session that laid out
+    2–4 choices, the whole decision is one keystroke — Enter takes the
+    recommendation. A question with no options falls back to a typed answer.
+    """
+    if not sys.stdin.isatty():
+        print("questionnaire is interactive — use `perpetua answer` in scripts",
+              file=sys.stderr)
+        return 1
+    goals = [need(args.goal_id)] if args.goal_id else sorted(
+        p for p in GOALS.iterdir() if (p / "state.json").exists())
+    pending = [(g, q) for g in goals for q in pp_human.open_questions(g)]
+    if not pending:
+        print("no open questions — nothing to answer")
+        return 0
+    explicit = getattr(args, "explicit", False)
+    print(f"{len(pending)} open question(s). " + ("Choose an explicit option; Enter skips. " if explicit else "Enter = the ★ recommendation, ") +
+          f"a key to pick, 's' skip, 'w' withdraw, 'q' quit.\n")
+    answered = 0
+    for g, q in pending:
+        target = next((r for r in pp_human.index(g) if r["n"] == q["n"]), None)
+        if target is None or not pp_human.is_open(target):
+            continue                                        # settled meanwhile
+        opts = target.get("options") or []
+        reco = pp_human.recommended_option(target)
+        print(f"── {g.name} · Q{target['n']} ─{'─' * 40}")
+        print(f"{target.get('subject', '')}\n")
+        print(textwrap.indent((target.get("body") or "").strip(), "  "))
+        if opts:
+            print("\n" + pp_human.render_options(opts, indent="  "))
+            prompt = "\n  choice (Enter skips): " if explicit else f"\n  choice [{reco['key'] if reco else ''}]: "
+        else:
+            prompt = "\n  your answer (free text): "
+        try:
+            raw = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nstopped.")
+            args.cancelled = True
+            break
+        low = raw.lower()
+        if low == "q":
+            args.cancelled = True
+            break
+        if low == "s" or (explicit and not raw) or (not raw and not reco and not opts):
+            print("  skipped\n")
+            continue
+        if low == "w":
+            reason = input("  withdraw reason (optional): ").strip()
+            pp_human.withdraw(g, target["n"], reason=reason or "withdrawn via questionnaire")
+            print("  withdrawn\n")
+            continue
+        try:
+            if opts:
+                key = (raw or (reco["key"] if reco else "")).upper()
+                note = input("  note to add (optional): ").strip() or None
+                _record_answer(g, target, text=note, option=key)
+            else:
+                if not raw:
+                    print("  skipped (no answer given)\n")
+                    continue
+                _record_answer(g, target, text=raw)
+        except ValueError as exc:
+            print(f"  {exc}\n")
+            continue
+        answered += 1
+        print("  ✓ recorded\n")
+    print(f"answered {answered} question(s). Each reaches the next session as "
+          f"priority-1 briefing content until a session has actually seen it.")
+    return 0
+
+
+def cmd_decide(args) -> int:
+    try:
+        return _decide(args)
+    except (EOFError, KeyboardInterrupt):
+        print("\nStopped; unanswered items remain in the Inbox.")
+        return 0
+    except ValueError as exc:
+        print(f"Decision not applied: {exc}", file=sys.stderr)
+        return 1
+
+
+def _decide(args) -> int:
+    if not sys.stdin.isatty():
+        print("decide needs a terminal; use inbox, answer, amend, ack or resume in scripts")
+        return 1
+    args.explicit = True
+    cmd_questionnaire(args)
+    if getattr(args, "cancelled", False):
+        return 0
+    goals = [need(args.goal_id)] if args.goal_id else [p for p in sorted(GOALS.iterdir()) if (p / "state.json").exists()]
+    for goal in goals:
+        for item in pp_control.inbox(goal):
+            if item["kind"] == "question":
+                continue
+            print(f"\n{goal.name} · {item['id']} · {item['subject']}\n{item['body']}")
+            if item["kind"] == "amendment":
+                print(json.dumps(item["record"].get("change"), indent=2))
+                choice = input("Type approve, reject, or Enter to skip: ").strip()
+                if choice == "approve":
+                    pp_amend.approve(goal, item["record"]["n"])
+                elif choice == "reject":
+                    reason = input("Reason: ").strip()
+                    if reason:
+                        pp_amend.reject(goal, item["record"]["n"], reason)
+            elif item["kind"] == "alert":
+                if input("Type ack to acknowledge, or Enter to skip: ").strip() == "ack":
+                    pp_escalate.acknowledge(goal, n=item["record"]["n"])
+            elif item["kind"] == "paused":
+                if input("Type resume to continue, or Enter to leave paused: ").strip() == "resume":
+                    cmd_resume(argparse.Namespace(goal_id=goal.name, no_start=False, background=True))
+    return 0
+
+
+def cmd_pause(args) -> int:
+    g = need(args.goal_id)
+    pp_control.request_pause(g)
+    if supervisor_pid(g) is None:
+        def apply(s):
+            s["status"] = pp_state.STATUS_PAUSED
+            s.setdefault("breaker", {})["paused_reason"] = "operator requested pause"
+        pp_state.patch(g, apply)
+    print(f"{g.name}: pause requested; an active session may finish its handoff")
+    return 0
+
+
+def cmd_route(args) -> int:
+    g = need(args.goal_id)
+    cfg, st = read_json(g / "goal.json", {}) or {}, pp_state.load(g)
+    print(json.dumps(pp_routing.decide(cfg, st, pp_backend.load_config()), indent=2))
+    return 0
+
+
+def cmd_feedback(args) -> int:
+    g = need(args.goal_id)
+    try:
+        pp_routing.feedback(g, outcome=args.outcome, evidence=args.evidence, run=args.run)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print("Recorded human-reviewed task outcome. The whole-goal completion check is not a model failure signal.")
+    return 0
+
+
+def _age(ts) -> str:
+    """' (3h ago)' — how long this has been sitting. The number an operator
+    actually reacts to; a bare ISO timestamp is not one."""
+    if not ts:
+        return ""
+    try:
+        then = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    secs = (datetime.now(timezone.utc) - then).total_seconds()
+    if secs < 3600:
+        return f" ({int(secs // 60)}m ago)"
+    if secs < 86400:
+        return f" ({secs / 3600:.1f}h ago)"
+    return f" ({secs / 86400:.1f}d ago)"
+
+
+def cmd_personas(args) -> int:
+    g = need(args.goal_id)
+    names = pp_persona.names(g)
+    if not names:
+        print("no personas yet — sessions write their own with persona_write")
+        return 0
+    # #4: the scoreboard first — which persona's own record actually shows it
+    # moving this goal, which is what the no-progress breaker rotates on.
+    print("── scoreboard ──")
+    print(pp_persona.render_scoreboard(pp_persona.scoreboard(g)))
+    print()
+    for name in names:
+        standing = "  ← standing" if name == pp_state.load(g).get("persona") else ""
+        print(f"── {name}{standing} ──")
+        print(pp_persona.read_persona(g, name).strip()[:800])
+        # The dossier is the half a human actually wants when asking who this
+        # identity is: the prompt says what it was told to be, the dossier says
+        # what it has done.
+        dossier = pp_persona.read_dossier(g, name).strip()
+        if dossier:
+            print()
+            print(f"── {name}: dossier ──")
+            print(dossier[-1200:])
+        print()
+    return 0
+
+
+def cmd_runs(args) -> int:
+    g = need(args.goal_id)
+    dirs = sorted((g / "runs").glob("[0-9]*"), reverse=True)[:args.number]
+    if not dirs:
+        print("no runs yet")
+        return 0
+    print(f"{'run':>5}  {'backend':<14} {'persona':<12} {'exit':>4} {'watchdog':<16} outcome")
+    for d in dirs:
+        r = read_json(d / "run.json", {}) or {}
+        if not r:
+            # run.json is written when the session ends, so its absence means the
+            # run is still in flight (or the supervisor was killed mid-run).
+            launch = read_json(d / "launch.json", {}) or {}
+            print(f"{run_no(d.name):>5}  {str(launch.get('backend', '?')):<14} "
+                  f"{str(launch.get('persona') or '-'):<12} {'':>4} {'in flight':<16} -")
+            continue
+        exit_kind = (r.get("exit") or {}).get("kind") or ("wedge" if r.get("wedged") else "-")
+        rid = str(r.get("run", d.name))
+        print(f"{rid:>5}  {str(r.get('backend', '?')):<14} "
+              f"{str(r.get('persona') or '-'):<12} {str(r.get('exit_code', '?')):>4} "
+              f"{str(r.get('watchdog', '?')):<16} {exit_kind}"
+              + ("  [resumed]" if r.get("resumed") else ""))
+        # #7: which commit(s) this exact run is attributed to, from the
+        # Perpetua-Run trailer every commit in the workspace now carries —
+        # git log alone cannot answer this.
+        shas = pp_attribute.commits_for_run(g / "workspace", rid)
+        if shas:
+            print(f"       commits: {', '.join(sha[:10] for sha in shas)}")
+    return 0
+
+
+def cmd_tail(args) -> int:
+    g = need(args.goal_id)
+    st = pp_state.load(g)
+    in_flight = pp_state.current_runs(st)
+    n = (in_flight[-1] if in_flight else {}).get("n") or st.get("run", 0)
+    logf = run_dir(g, n) / "pi.log"
+    if not logf.exists():
+        sys.exit(f"no log at {logf}")
+    args_tail = ["-f", str(logf)] if args.follow else ["-n", "200", str(logf)]
+    return subprocess.call(["tail", *args_tail])
+
+
+def _check(g: Path) -> pp_check.Result:
+    # Same timeout, same environment and same "could it run at all" verdict as the
+    # supervisor uses — see pp_check for why there is only one of these now.
+    return pp_check.run(g)
+
+
+def cmd_check(args) -> int:
+    g = need(args.goal_id)
+    res = _check(g)
+    print(res.detail)
+    if not res.ran:
+        # "could not run" is not "not met": a timed-out or missing check must not
+        # be reported as a clean negative, because the supervisor does not treat
+        # it as one either.
+        print("\n=> COULD NOT RUN — this goal cannot self-declare completion")
+        return 2
+    print(f"\n=> {'PASS — the goal is accomplished' if res.passed else 'not met yet'}")
+    return 0 if res.passed else 1
+
+
+def cmd_attach(args) -> int:
+    g = need(args.goal_id)
+    sess = f"perpetua-{g.name}"
+    if subprocess.run(["tmux", "has-session", "-t", f"={sess}"],
+                      capture_output=True).returncode != 0:
+        print(f"no tmux session '{sess}' — the goal has not run since tmux support "
+              f"was added, or the supervisor is stopped.")
+        return 1
+    # Attach in place if we are outside tmux; switch the client if we are inside.
+    inside = bool(os.environ.get("TMUX"))
+    verb = "switch-client" if inside else "attach-session"
+    print(f"{'switching to' if inside else 'attaching to'} {sess} "
+          f"(detach with ctrl-b d)")
+    return subprocess.call(["tmux", verb, "-t", f"={sess}"])
+
+
+def cmd_dash(args) -> int:
+    if getattr(args, "window", False):
+        # kitty is this user's terminal; give the dashboard its own window rather
+        # than occupying the shell they launched it from.
+        kitty = shutil.which("kitty")
+        if not kitty:
+            print("kitty not found — opening in this terminal instead")
+        else:
+            subprocess.Popen(
+                [kitty, "--title", "perpetua", "--override", "confirm_os_window_close=0",
+                 "-e", str(BIN / "perpetua"), "dash"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("opened the perpetua dashboard in a new kitty window")
+            return 0
+    if not sys.stdout.isatty():
+        sys.exit("perpetua dash needs a terminal (try `perpetua status` instead)")
+    import pp_tui
+    return pp_tui.main()
+
+
+def cmd_backends(_args) -> int:
+    cfg = pp_backend.load_config()
+    for group, label in (("classes", "local"), ("hosted_classes", "hosted")):
+        for name, spec in cfg.get(group, {}).items():
+            spec = {**spec, "class": name}
+            unit = spec.get("unit")
+            active = pp_backend.unit_active(unit) if unit else False
+            # A hosted class has no local endpoint, so health() trivially passes;
+            # printing "up" for it would be a lie about something we never checked.
+            api = ("n/a" if not spec.get("base_url")
+                   else ("up" if pp_backend.health(spec) else "down"))
+            model = f"{spec['provider']}/{spec['model']}"
+            print(f"{name:<16} {label:<7} {model:<40} "
+                  f"unit={'-' if not unit else ('active' if active else 'stopped'):<8} "
+                  f"api={api}")
+            warn = pp_backend.check_guard(spec)
+            if warn:
+                print(f"{'':<16} ⚠️  {warn}")
+    return 0
+
+
+# ── argparse ──────────────────────────────────────────────────────────────
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="perpetua", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("pause", help="pause durably after the current handoff")
+    p.add_argument("goal_id")
+    p.set_defaults(fn=cmd_pause)
+    p = sub.add_parser("decide", help="unified questions, amendments and recovery decisions")
+    p.add_argument("goal_id", nargs="?")
+    p.set_defaults(fn=cmd_decide)
+    p = sub.add_parser("route", help="explain the next route without changing anything")
+    p.add_argument("goal_id")
+    p.set_defaults(fn=cmd_route)
+    p = sub.add_parser("feedback", help="record a reviewed task outcome for quality routing")
+    p.add_argument("goal_id")
+    p.add_argument("run")
+    p.add_argument("outcome", choices=["accepted", "semantic-failure", "blocked"])
+    p.add_argument("--evidence", required=True)
+    p.set_defaults(fn=cmd_feedback)
+
+    p = sub.add_parser("new", help="create a goal (no arguments = interview)")
+    p.add_argument("goal_id", nargs="?",
+                   help="omit to be interviewed instead of passing flags")
+    p.add_argument("--title")
+    p.add_argument("--objective")
+    p.add_argument("--rationale")
+    p.add_argument("--criterion", action="append", help="repeatable success criterion")
+    p.add_argument("--constraint")
+    p.add_argument("--boundaries", help="text of the human's fence, seeded as "
+                                        "BOUNDARIES.md (template if omitted)")
+    p.add_argument("--check", help="path to a check.sh to install")
+    p.add_argument("--from-spec", help="create from an interview spec JSON file")
+    p.add_argument("--backend", default=None, help="default workload class")
+    p.add_argument("--allow-hosted", action="store_true",
+                   help="permit hosted models for this goal (default: local only)")
+    p.add_argument("--consolidate-every", type=int, default=10)
+    p.add_argument("--max-runs", type=int, default=None, help="default: unlimited")
+    p.add_argument("--session-timeout", type=int, default=10800)
+    p.add_argument("--stall-timeout", type=int, default=2400)
+    p.add_argument("--check-timeout", type=int, default=int(pp_check.DEFAULT_TIMEOUT_S),
+                   help="seconds check.sh may take; the session's own `check` and "
+                        "the dashboard cap their wait below this but defer to it")
+    p.add_argument("--notify", action="store_true",
+                   help="opt in to configured out-of-band notifications")
+    p.add_argument("--no-notify", action="store_true",
+                   help="disable notifications (takes precedence over --notify)")
+    p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("start", help="run the supervisor in the foreground")
+    p.add_argument("goal_id")
+    p.add_argument("--once", action="store_true")
+    p.add_argument("--max-runs", type=int, default=None)
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser("run", help="run exactly one session")
+    p.add_argument("goal_id")
+    p.set_defaults(fn=lambda a: cmd_start(argparse.Namespace(goal_id=a.goal_id, once=True,
+                                                             max_runs=None)))
+
+    p = sub.add_parser("resume", help="clear a pause and continue")
+    p.add_argument("goal_id")
+    p.add_argument("--background", action="store_true",
+                   help="launch an unmanaged goal detached (does not enable it at boot)")
+    p.add_argument("--no-start", action="store_true",
+                   help="only clear the pause; do not restart the supervisor")
+    p.set_defaults(fn=cmd_resume)
+
+    p = sub.add_parser("ack", help="acknowledge a paused goal's escalation "
+                                   "without resuming it")
+    p.add_argument("goal_id")
+    p.set_defaults(fn=cmd_ack)
+
+    p = sub.add_parser("escalate-check", help="staleness-bump check for "
+                                              "paused goals (fallback for a "
+                                              "systemd timer; run at goal "
+                                              "startup too)")
+    p.add_argument("goal_id", nargs="?", help="omit to check every goal")
+    p.set_defaults(fn=cmd_escalate_check)
+
+    p = sub.add_parser("amend", help="the human side of charter amendments")
+    p.add_argument("goal_id")
+    p.add_argument("--list", action="store_true",
+                   help="show every amendment, newest first (default)")
+    p.add_argument("--approve", metavar="N", type=int,
+                   help="approve and apply amendment N (hard ones needed a human)")
+    p.add_argument("--reject", metavar="N", type=int,
+                   help="reject amendment N")
+    p.add_argument("--reason", default="",
+                   help="required with --reject: why the amendment is refused")
+    p.set_defaults(fn=cmd_amend)
+
+    p = sub.add_parser("watchers", help="list/revoke the goal's legacy watchers")
+    p.add_argument("goal_id")
+    p.add_argument("--revoke", metavar="NAME", help="revoke one watcher")
+    p.add_argument("--reason", default="",
+                   help="why it is revoked (with --revoke)")
+    p.set_defaults(fn=cmd_watchers)
+
+    p = sub.add_parser("swarm", help="explore the next run K ways in parallel")
+    p.add_argument("goal_id")
+    p.add_argument("--request", action="store_true",
+                   help="make the next run a swarm")
+    p.add_argument("--cancel", action="store_true",
+                   help="withdraw a pending swarm request")
+    p.set_defaults(fn=cmd_swarm)
+
+    p = sub.add_parser("holds", help="live cross-goal backend holds "
+                                     "(who owns the model server right now)")
+    p.set_defaults(fn=cmd_holds)
+
+    for name, fn, helptext in (("enable", cmd_enable, "run as a systemd user unit"),
+                               ("disable", cmd_disable, "stop the systemd unit"),
+                               ("personas", cmd_personas, "show self-authored personas"),
+                               ("check", cmd_check, "run the completion predicate"),
+                               ("attach", cmd_attach, "attach to this goal's live tmux session")):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("goal_id")
+        p.set_defaults(fn=fn)
+
+    p = sub.add_parser("inbox", help="everything waiting on YOU, across every goal")
+    p.add_argument("goal_id", nargs="?")
+    p.add_argument("--full", action="store_true",
+                   help="print each question in full instead of its first line")
+    p.set_defaults(fn=cmd_inbox)
+
+    p = sub.add_parser("answer", help="answer a question a session raised for you")
+    p.add_argument("goal_id")
+    p.add_argument("n", type=int, help="the question number, from `perpetua inbox`")
+    p.add_argument("text", nargs="?", default="",
+                   help="your decision in free text; optional if you pass -o")
+    p.add_argument("-o", "--option", default="",
+                   help="pick one of the options the session offered, by its "
+                        "key (A, B, …); `text` then rides along as a note")
+    p.set_defaults(fn=cmd_answer)
+
+    p = sub.add_parser("questionnaire",
+                       help="walk every open question and answer by picking an option")
+    p.add_argument("goal_id", nargs="?", help="omit to cover every goal")
+    p.set_defaults(fn=cmd_questionnaire)
+
+    p = sub.add_parser("status", help="where every goal stands")
+    p.add_argument("goal_id", nargs="?")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("journal", help="the handoff chain")
+    p.add_argument("goal_id")
+    p.add_argument("-n", "--number", type=int, default=3)
+    p.set_defaults(fn=cmd_journal)
+
+    p = sub.add_parser("board", help="read or search the message board")
+    p.add_argument("goal_id")
+    p.add_argument("--channel")
+    p.add_argument("--since", type=int, default=0)
+    p.add_argument("-n", "--number", type=int, default=30)
+    p.add_argument("--full", action="store_true",
+                   help="print message bodies in full, however long")
+    p.add_argument("--search", metavar="Q",
+                   help="search instead of reading; prints one-line hits")
+    p.add_argument("--regex", action="store_true",
+                   help="treat --search as a regular expression")
+    p.add_argument("--author", help="filter by author (with --search)")
+    p.set_defaults(fn=cmd_board)
+
+    p = sub.add_parser("runs", help="per-session outcomes")
+    p.add_argument("goal_id")
+    p.add_argument("-n", "--number", type=int, default=20)
+    p.set_defaults(fn=cmd_runs)
+
+    p = sub.add_parser("tail", help="show the current session's log")
+    p.add_argument("goal_id")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.set_defaults(fn=cmd_tail)
+
+    p = sub.add_parser("backends", help="workload classes and their health")
+    p.set_defaults(fn=cmd_backends)
+
+    p = sub.add_parser("dash", help="the dashboard (also what bare `perpetua` opens)")
+    p.add_argument("--window", action="store_true",
+                   help="open in its own kitty window instead of this terminal")
+    p.set_defaults(fn=cmd_dash)
+
+    # Bare `perpetua` opens the dashboard. The subcommands stay for scripting and
+    # for the supervisor itself, but nobody should have to memorise them.
+    if len(sys.argv) == 1:
+        return cmd_dash(argparse.Namespace(window=False))
+
+    args = ap.parse_args()
+    try:
+        return args.fn(args)
+    except UnsafeGoalId as exc:
+        sys.exit(f"bad goal id: {exc}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

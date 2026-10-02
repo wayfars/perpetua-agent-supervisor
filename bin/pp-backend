@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""pp-backend — the audited path to the model servers.
+
+  pp-backend list                 classes, units, health
+  pp-backend ensure <class>       make that class the loaded backend, prove it answers
+  pp-backend heal <class>         restart it to clear a wedged prompt-state cache
+  pp-backend probe <class>        one real completion, checked for degeneracy
+
+Refuses any systemd unit not declared in config/backends.json.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import pp_backend                                          # noqa: E402
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(__doc__)
+        return 1
+    cmd = argv[1]
+    if cmd == "list":
+        cfg = pp_backend.load_config()
+        for group in ("classes", "hosted_classes"):
+            for name, spec in cfg.get(group, {}).items():
+                unit = spec.get("unit") or "-"
+                print(f"{name:<16} {spec['provider']}/{spec['model']:<30} {unit}")
+        return 0
+
+    if len(argv) < 3:
+        print(f"usage: pp-backend {cmd} <class>")
+        return 1
+    spec = pp_backend.resolve(argv[2], allow_hosted=True)
+
+    if cmd == "ensure":
+        ok, detail = pp_backend.ensure(spec)
+    elif cmd == "heal":
+        ok, detail = pp_backend.heal(spec)
+    elif cmd == "probe":
+        ok, detail = pp_backend.probe(spec)
+    else:
+        print(__doc__)
+        return 1
+    print(f"{'OK' if ok else 'FAIL'}: {detail}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
